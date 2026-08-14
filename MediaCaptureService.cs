@@ -12,6 +12,8 @@ namespace AIXWhatsAppLocal;
 /// Pipeline per image:
 /// CHAT_DETECTED → CUSTOMER_IDENTIFIED → MEDIA_DETECTED → MEDIA_DOWNLOADED
 /// → DUPLICATE_CHECK → FILE_SAVED → CUSTOMER_COUNT_UPDATED
+///
+/// Reports live status to WhatsAppForm/MainForm via events.
 /// </summary>
 public sealed class MediaCaptureService : IDisposable
 {
@@ -20,7 +22,15 @@ public sealed class MediaCaptureService : IDisposable
     private readonly MediaDatabase _db;
     private readonly string _ordersRoot;
 
+    // Events for live dashboard
     public event Action<string>? CaptureStatusChanged;
+    public event Action<string>? ScannerStatusChanged;
+    public event Action<int>? UnreadChatsChanged;
+    public event Action<string>? CurrentChatChanged;
+    public event Action<int>? ImagesDetectedChanged;
+    public event Action<int>? ImagesSavedChanged;
+    public event Action<string>? LastSavedFileChanged;
+    public event Action<string>? LastErrorChanged;
 
     public MediaCaptureService(CoreWebView2 webView, LogService log, MediaDatabase db, string ordersRoot)
     {
@@ -41,17 +51,23 @@ public sealed class MediaCaptureService : IDisposable
             return;
         }
 
+        ScannerStatusChanged?.Invoke("Scanning...");
         UpdateStatus("Scanning chats...");
 
         var node = await ExecuteScriptJsonAsync(Scripts.GetUnreadChats);
         var chats = node?["chats"]?.AsArray();
+        var unreadCount = chats?.Count ?? 0;
+        UnreadChatsChanged?.Invoke(unreadCount);
+
         if (chats == null || chats.Count == 0)
         {
+            ScannerStatusChanged?.Invoke("Idle — no unread chats");
             UpdateStatus("Idle — no unread chats");
             return;
         }
 
         _log.Write("SCAN_START", $"unread_chats={chats.Count}");
+        ScannerStatusChanged?.Invoke($"Scanning {chats.Count} chats");
         var totalSaved = 0;
         var totalDuplicates = 0;
 
@@ -62,6 +78,7 @@ public sealed class MediaCaptureService : IDisposable
             if (string.IsNullOrWhiteSpace(name)) continue;
 
             _log.Write("CHAT_DETECTED", $"name={name}");
+            CurrentChatChanged?.Invoke(name);
             UpdateStatus($"Opening: {name}");
 
             // Open the chat
@@ -91,6 +108,7 @@ public sealed class MediaCaptureService : IDisposable
             if (string.IsNullOrWhiteSpace(customerName)) customerName = "Unknown";
 
             _log.Write("CUSTOMER_IDENTIFIED", $"name={customerName} phone={phone}");
+            CurrentChatChanged?.Invoke(customerName);
 
             // Detect images in the current chat
             var imagesNode = await ExecuteScriptJsonAsync(Scripts.DetectImages);
@@ -102,6 +120,7 @@ public sealed class MediaCaptureService : IDisposable
             }
 
             _log.Write("MEDIA_DETECTED", $"count={images.Count}");
+            ImagesDetectedChanged?.Invoke(images.Count);
             var detected = images.Count;
             var saved = 0;
             var duplicates = 0;
@@ -154,6 +173,7 @@ public sealed class MediaCaptureService : IDisposable
                 var imageIndex = CustomerFolderService.GetNextImageIndex(folderPath);
                 var localPath = CustomerFolderService.SaveImage(folderPath, imageBytes, imageIndex);
                 _log.Write("FILE_SAVED", $"path={localPath}");
+                LastSavedFileChanged?.Invoke(localPath);
 
                 // Update folder count (rename folder to match actual file count)
                 var actualFolder = CustomerFolderService.UpdateFolderCount(folderPath);
@@ -167,6 +187,7 @@ public sealed class MediaCaptureService : IDisposable
 
                 saved++;
                 totalSaved++;
+                ImagesSavedChanged?.Invoke(1);
             }
 
             // Reconciliation: detected = saved + duplicates
@@ -175,13 +196,17 @@ public sealed class MediaCaptureService : IDisposable
             if (reconStatus == "MISMATCH")
             {
                 _log.Write("RECONCILIATION_ERROR", $"detected={detected} saved={saved} duplicates={duplicates}");
+                LastErrorChanged?.Invoke($"Reconciliation mismatch: detected={detected} saved={saved} dup={duplicates}");
             }
 
+            CurrentChatChanged?.Invoke($"{customerName} — {saved} new, {duplicates} dup");
             UpdateStatus($"Processed: {customerName} — {saved} new, {duplicates} dup");
         }
 
         _log.Write("SCAN_COMPLETE", $"total_saved={totalSaved} total_duplicates={totalDuplicates}");
+        ScannerStatusChanged?.Invoke($"Done — {totalSaved} new, {totalDuplicates} dup");
         UpdateStatus($"Scan done — {totalSaved} new, {totalDuplicates} dup");
+        CurrentChatChanged?.Invoke("—");
     }
 
     /// <summary>
@@ -198,6 +223,7 @@ public sealed class MediaCaptureService : IDisposable
             {
                 var error = node["error"]?.GetValue<string>() ?? "unknown";
                 _log.Write("MEDIA_DOWNLOAD_FAILED", $"url={url} error={error}");
+                LastErrorChanged?.Invoke($"Download failed: {error}");
                 return null;
             }
 
@@ -208,6 +234,7 @@ public sealed class MediaCaptureService : IDisposable
         catch (Exception ex)
         {
             _log.Write("MEDIA_DOWNLOAD_FAILED", $"url={url} error={ex.Message}");
+            LastErrorChanged?.Invoke($"Download exception: {ex.Message}");
             return null;
         }
     }

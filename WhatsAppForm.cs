@@ -12,6 +12,8 @@ namespace AIXWhatsAppLocal;
 /// Also runs the media capture auto-scan: every 15 seconds, scans the chat list
 /// for unread chats, opens each one, downloads new images, and saves them to
 /// local customer folders.
+///
+/// Reports live status back to MainForm via events (single dashboard, no separate window).
 /// </summary>
 public sealed class WhatsAppForm : Form
 {
@@ -27,6 +29,17 @@ public sealed class WhatsAppForm : Form
     private MediaDatabase? _mediaDb;
     private MediaCaptureService? _mediaCapture;
 
+    // Events for MainForm live status
+    public event Action<string>? WhatsAppStatusChanged;
+    public event Action<string>? ScannerStatusChanged;
+    public event Action<int>? UnreadChatsChanged;
+    public event Action<string>? CurrentChatChanged;
+    public event Action<int>? ImagesDetectedChanged;
+    public event Action<int>? ImagesSavedChanged;
+    public event Action<string>? LastSavedFileChanged;
+    public event Action<string>? LastErrorChanged;
+
+    // Legacy status event (kept for backward compat)
     public event Action<string>? StatusChanged;
 
     public WhatsAppForm(LogService log, AppConfig config)
@@ -105,6 +118,7 @@ public sealed class WhatsAppForm : Form
         {
             _log.Write("whatsapp_init_failed", ex.Message);
             UpdateStatus("Error — install Microsoft Edge WebView2 Runtime");
+            LastErrorChanged?.Invoke(ex.Message);
         }
     }
 
@@ -114,6 +128,7 @@ public sealed class WhatsAppForm : Form
         {
             UpdateStatus("WhatsApp: Failed to load");
             _log.Write("whatsapp_navigation_failed");
+            LastErrorChanged?.Invoke("WhatsApp navigation failed");
             return;
         }
 
@@ -136,6 +151,7 @@ public sealed class WhatsAppForm : Form
         {
             _log.Write("MEDIA_CAPTURE_SKIP", "reason=orders_root_not_set");
             UpdateCaptureStatus("Media: Set orders folder first");
+            ScannerStatusChanged?.Invoke("Set orders folder first");
             return;
         }
 
@@ -144,7 +160,16 @@ public sealed class WhatsAppForm : Form
             var dbPath = Path.Combine(ConfigService.AppDataDirectory, "local.db");
             _mediaDb = new MediaDatabase(dbPath);
             _mediaCapture = new MediaCaptureService(_webView.CoreWebView2, _log, _mediaDb, ordersRoot);
+
+            // Wire up capture service events to MainForm
             _mediaCapture.CaptureStatusChanged += status => UpdateCaptureStatus($"Media: {status}");
+            _mediaCapture.ScannerStatusChanged += status => ScannerStatusChanged?.Invoke(status);
+            _mediaCapture.UnreadChatsChanged += count => UnreadChatsChanged?.Invoke(count);
+            _mediaCapture.CurrentChatChanged += name => CurrentChatChanged?.Invoke(name);
+            _mediaCapture.ImagesDetectedChanged += count => ImagesDetectedChanged?.Invoke(count);
+            _mediaCapture.ImagesSavedChanged += count => ImagesSavedChanged?.Invoke(count);
+            _mediaCapture.LastSavedFileChanged += path => LastSavedFileChanged?.Invoke(path);
+            _mediaCapture.LastErrorChanged += error => LastErrorChanged?.Invoke(error);
 
             // Start auto-scan timer (every 15 seconds)
             _scanTimer = new System.Windows.Forms.Timer { Interval = 15000 };
@@ -153,11 +178,14 @@ public sealed class WhatsAppForm : Form
 
             _log.Write("MEDIA_CAPTURE_ENABLED", $"orders_root={ordersRoot}");
             UpdateCaptureStatus("Media: Ready — auto-scanning");
+            ScannerStatusChanged?.Invoke("Auto-scanning");
         }
         catch (Exception ex)
         {
             _log.Write("MEDIA_CAPTURE_INIT_FAILED", ex.Message);
             UpdateCaptureStatus($"Media: Error — {ex.Message}");
+            ScannerStatusChanged?.Invoke($"Error: {ex.Message}");
+            LastErrorChanged?.Invoke(ex.Message);
         }
     }
 
@@ -173,6 +201,7 @@ public sealed class WhatsAppForm : Form
         catch (Exception ex)
         {
             _log.Write("scan_error", ex.Message);
+            LastErrorChanged?.Invoke(ex.Message);
         }
         finally
         {
@@ -238,6 +267,7 @@ public sealed class WhatsAppForm : Form
         if (IsDisposed) return;
         if (InvokeRequired) { Invoke(() => UpdateStatus(status)); return; }
         _statusLabel.Text = $"WhatsApp: {status}";
+        WhatsAppStatusChanged?.Invoke(status);
         StatusChanged?.Invoke(status);
     }
 
