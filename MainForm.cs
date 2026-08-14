@@ -183,6 +183,11 @@ public sealed class MainForm : Form
     private void OnOpenWhatsApp(object? sender, EventArgs e)
     {
         _log.Write("whatsapp_opening");
+        _imagesDetectedToday = 0;
+        _imagesSavedToday = 0;
+        UpdateLabel(_imagesDetectedLabel, "0");
+        UpdateLabel(_imagesSavedLabel, "0");
+        UpdateLabel(_unreadChatsLabel, "0");
         var waForm = new WhatsAppForm(_log, _appConfig);
 
         // Wire up live status updates from WhatsAppForm

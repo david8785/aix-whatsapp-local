@@ -56,12 +56,19 @@ public sealed class MediaCaptureService : IDisposable
 
         var node = await ExecuteScriptJsonAsync(Scripts.GetUnreadChats);
         var chats = node?["chats"]?.AsArray();
+        var chatRowsFound = node?["chatRowsFound"]?.GetValue<int>() ?? 0;
+        var unreadMarkersFound = node?["unreadMarkersFound"]?.GetValue<int>() ?? 0;
         var unreadCount = chats?.Count ?? 0;
+
+        // Diagnostic logging
+        _log.Write("CHAT_ROWS_FOUND", chatRowsFound.ToString());
+        _log.Write("UNREAD_MARKERS_FOUND", unreadMarkersFound.ToString());
+        _log.Write("UNREAD_CHAT_MATCHES", unreadCount.ToString());
         UnreadChatsChanged?.Invoke(unreadCount);
 
         if (chats == null || chats.Count == 0)
         {
-            ScannerStatusChanged?.Invoke("Idle — no unread chats");
+            ScannerStatusChanged?.Invoke($"Idle — {chatRowsFound} chats, {unreadMarkersFound} markers");
             UpdateStatus("Idle — no unread chats");
             return;
         }
@@ -77,7 +84,9 @@ public sealed class MediaCaptureService : IDisposable
             var name = chat?["name"]?.GetValue<string>() ?? "";
             if (string.IsNullOrWhiteSpace(name)) continue;
 
-            _log.Write("CHAT_DETECTED", $"name={name}");
+            var chatUnreadCount = chat?["unreadCount"]?.GetValue<int>() ?? 0;
+            _log.Write("CHAT_NAME", name);
+            _log.Write("UNREAD_COUNT", chatUnreadCount.ToString());
             CurrentChatChanged?.Invoke(name);
             UpdateStatus($"Opening: {name}");
 
@@ -287,20 +296,102 @@ public sealed class MediaCaptureService : IDisposable
         public const string GetUnreadChats = """
             (() => {
                 const pane = document.querySelector('#pane-side');
-                if (!pane) return JSON.stringify({ chats: [] });
-                const items = pane.querySelectorAll('[role="listitem"]');
+                if (!pane) return JSON.stringify({ chats: [], chatRowsFound: 0, unreadMarkersFound: 0 });
+                
+                var items = pane.querySelectorAll('[role="listitem"]');
+                if (items.length === 0) items = pane.querySelectorAll('[data-testid="cell-frame-container"]');
+                if (items.length === 0) items = pane.querySelectorAll('div[data-id]');
+                if (items.length === 0) items = pane.querySelectorAll('div[role="button"]');
+                
+                const chatRowsFound = items.length;
+                var unreadMarkersFound = 0;
                 const chats = [];
-                items.forEach((item, idx) => {
-                    const badge = item.querySelector('span[aria-label*="unread"]') ||
-                                  item.querySelector('[data-testid="unread-count"]') ||
-                                  item.querySelector('span[aria-label*="הודעות"]');
-                    const nameEl = item.querySelector('span[title]');
-                    const name = nameEl ? nameEl.getAttribute('title') : '';
-                    if (badge && name) {
-                        chats.push({ index: idx, name: name });
+                
+                items.forEach(function(item, idx) {
+                    var badge = null;
+                    var unreadCount = 0;
+                    
+                    // Method 1: aria-label containing "unread"
+                    badge = item.querySelector('span[aria-label*="unread" i]');
+                    if (!badge) badge = item.querySelector('div[aria-label*="unread" i]');
+                    if (!badge) badge = item.querySelector('span[aria-label*="הודעות"]');
+                    
+                    // Method 2: data-testid with "unread"
+                    if (!badge) badge = item.querySelector('[data-testid*="unread" i]');
+                    
+                    // Method 3: WhatsApp green badge (rgb(37,211,102)) with a number
+                    if (!badge) {
+                        var spans = item.querySelectorAll('span');
+                        for (var i = 0; i < spans.length; i++) {
+                            var sp = spans[i];
+                            var t = (sp.textContent || '').trim();
+                            if (/^\d+$/.test(t) && t.length <= 3 && sp.offsetWidth > 0 && sp.offsetWidth <= 30) {
+                                var st = window.getComputedStyle(sp);
+                                var bg = st.backgroundColor;
+                                if (bg && (bg.indexOf('37, 211, 102') >= 0 || bg.indexOf('25, 211, 102') >= 0 || bg.indexOf('37,211,102') >= 0 || bg.indexOf('25,211,102') >= 0)) {
+                                    badge = sp;
+                                    unreadCount = parseInt(t);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Method 4: Any small number at the right side of the row (badge position)
+                    if (!badge) {
+                        var spans2 = item.querySelectorAll('span');
+                        for (var j = 0; j < spans2.length; j++) {
+                            var sp2 = spans2[j];
+                            var t2 = (sp2.textContent || '').trim();
+                            if (/^\d+$/.test(t2) && t2.length <= 3 && sp2.offsetWidth > 0 && sp2.offsetWidth <= 30) {
+                                var rect = sp2.getBoundingClientRect();
+                                var itemRect = item.getBoundingClientRect();
+                                if (rect.right > itemRect.right - 60 && rect.width > 0) {
+                                    badge = sp2;
+                                    unreadCount = parseInt(t2);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Method 5: Green dot/circle indicator (unread without count)
+                    if (!badge) {
+                        var allEls = item.querySelectorAll('span, div');
+                        for (var k = 0; k < allEls.length; k++) {
+                            var el = allEls[k];
+                            var stl = window.getComputedStyle(el);
+                            var bgc = stl.backgroundColor;
+                            if (bgc && (bgc.indexOf('37, 211, 102') >= 0 || bgc.indexOf('25, 211, 102') >= 0 || bgc.indexOf('37,211,102') >= 0)) {
+                                if (el.offsetWidth > 0 && el.offsetWidth <= 25 && el.offsetHeight <= 25) {
+                                    var elText = (el.textContent || '').trim();
+                                    badge = el;
+                                    unreadCount = elText ? parseInt(elText) : 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (badge) {
+                        unreadMarkersFound++;
+                        var nameEl = item.querySelector('span[title]');
+                        var name = nameEl ? nameEl.getAttribute('title') : '';
+                        if (unreadCount === 0) {
+                            var badgeText = (badge.textContent || '').trim();
+                            unreadCount = parseInt(badgeText) || 1;
+                        }
+                        if (name) {
+                            chats.push({ index: idx, name: name, unreadCount: unreadCount });
+                        }
                     }
                 });
-                return JSON.stringify({ chats: chats });
+                
+                return JSON.stringify({ 
+                    chats: chats, 
+                    chatRowsFound: chatRowsFound, 
+                    unreadMarkersFound: unreadMarkersFound 
+                });
             })();
             """;
 
