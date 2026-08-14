@@ -1,0 +1,22 @@
+## .NET
+bin/
+obj/
+*.user
+*.suo
+.vs/
+*.userprefs
+
+## Build artifacts
+*.exe
+*.dll
+*.pdb
+*.msi
+
+## NuGet
+*.nupkg
+.nuget/
+
+## IDE
+.idea/
+*.swp
+*~
