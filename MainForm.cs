@@ -3,9 +3,9 @@ using System.Windows.Forms;
 namespace AIXWhatsAppLocal;
 
 /// <summary>
-/// Main window — Phase 0: minimal UI with two buttons and status.
-/// 1. Choose Local Folder — user picks where photos go.
-/// 2. Open WhatsApp — opens WhatsApp Web in a WebView2 window with persistent session.
+/// Main window — Milestone 2: WhatsApp → Local Order Folders.
+/// 1. Choose Orders Folder — user picks where customer image folders go.
+/// 2. Open WhatsApp — opens WhatsApp Web with persistent session + auto media capture.
 /// </summary>
 public sealed class MainForm : Form
 {
@@ -46,7 +46,7 @@ public sealed class MainForm : Form
 
         var subtitle = new Label
         {
-            Text = "WhatsApp Web → Photos → Local Folder",
+            Text = "WhatsApp Web → Local Order Folders",
             Font = new Font(Font.FontFamily, 9F),
             ForeColor = Color.Gray,
             Location = new Point(24, 52),
@@ -55,7 +55,7 @@ public sealed class MainForm : Form
 
         _chooseFolderButton = new Button
         {
-            Text = "Choose Local Folder",
+            Text = "Choose Orders Folder",
             Location = new Point(24, 90),
             Size = new Size(220, 48),
             Font = new Font(Font.FontFamily, 10F)
@@ -81,7 +81,7 @@ public sealed class MainForm : Form
 
         _folderLabel = new Label
         {
-            Text = "Selected Folder: (none)",
+            Text = "Orders Folder: (none)",
             Location = new Point(24, 200),
             Size = new Size(448, 30),
             Font = new Font(Font.FontFamily, 9F),
@@ -102,14 +102,14 @@ public sealed class MainForm : Form
 
     private void UpdateStatus()
     {
-        _folderLabel.Text = $"Selected Folder: {(string.IsNullOrWhiteSpace(_appConfig.SelectedFolder) ? "(none)" : _appConfig.SelectedFolder)}";
+        _folderLabel.Text = $"Orders Folder: {(string.IsNullOrWhiteSpace(_appConfig.SelectedFolder) ? "(none)" : _appConfig.SelectedFolder)}";
     }
 
     private void OnChooseFolder(object? sender, EventArgs e)
     {
         using var dialog = new FolderBrowserDialog
         {
-            Description = "Choose a folder for WhatsApp photos",
+            Description = "Choose where to save WhatsApp order images",
             ShowNewFolderButton = true
         };
 
@@ -130,7 +130,7 @@ public sealed class MainForm : Form
     private void OnOpenWhatsApp(object? sender, EventArgs e)
     {
         _log.Write("whatsapp_opening");
-        var waForm = new WhatsAppForm(_log);
+        var waForm = new WhatsAppForm(_log, _appConfig);
         waForm.StatusChanged += status =>
         {
             if (_statusLabel.InvokeRequired)
