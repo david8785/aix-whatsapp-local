@@ -22,6 +22,11 @@ public sealed class MediaCaptureService : IDisposable
     private readonly MediaDatabase _db;
     private readonly string _ordersRoot;
 
+    // CDP network interception for image downloads
+    private readonly Dictionary<string, NetworkResponseInfo> _networkResponses = new(StringComparer.OrdinalIgnoreCase);
+    private readonly object _networkLock = new();
+    private bool _cdpEnabled;
+
     // Events for live dashboard
     public event Action<string>? CaptureStatusChanged;
     public event Action<string>? ScannerStatusChanged;
@@ -41,6 +46,55 @@ public sealed class MediaCaptureService : IDisposable
     }
 
     /// <summary>
+    /// Enable CDP network interception to capture image response bodies.
+    /// Called once at the start of the first scan.
+    /// </summary>
+    private async Task EnableCdpAsync()
+    {
+        if (_cdpEnabled) return;
+        _cdpEnabled = true;
+
+        _webView.GetDevToolsProtocolEventReceiver("Network.responseReceived").DevToolsProtocolEventReceived += OnNetworkResponseReceived;
+        await _webView.CallDevToolsProtocolMethodAsync("Network.enable", "{}");
+        _log.Write("CDP_NETWORK_ENABLED");
+    }
+
+    /// <summary>
+    /// Track image network responses for later retrieval via Network.getResponseBody.
+    /// </summary>
+    private void OnNetworkResponseReceived(object? sender, CoreWebView2DevToolsProtocolEventReceivedEventArgs e)
+    {
+        try
+        {
+            var json = e.ParameterObjectAsJson;
+            if (string.IsNullOrEmpty(json)) return;
+            using var doc = JsonDocument.Parse(json);
+            var root = doc.RootElement;
+
+            if (!root.TryGetProperty("response", out var response)) return;
+            if (!response.TryGetProperty("url", out var urlProp)) return;
+            if (!response.TryGetProperty("mimeType", out var mimeProp)) return;
+
+            var url = urlProp.GetString() ?? "";
+            var mimeType = mimeProp.GetString() ?? "";
+            var requestId = root.TryGetProperty("requestId", out var reqIdProp) ? reqIdProp.GetString() ?? "" : "";
+
+            if (string.IsNullOrWhiteSpace(url) || string.IsNullOrWhiteSpace(requestId)) return;
+
+            // Only track image responses
+            if (!mimeType.StartsWith("image/", StringComparison.OrdinalIgnoreCase)) return;
+
+            lock (_networkLock)
+            {
+                _networkResponses[url] = new NetworkResponseInfo { RequestId = requestId, MimeType = mimeType, Url = url };
+            }
+        }
+        catch
+        {
+        }
+    }
+
+    /// <summary>
     /// Main scan loop: find unread chats, open each, detect images, download, dedup, save.
     /// </summary>
     public async Task ScanAndCaptureAsync()
@@ -50,6 +104,9 @@ public sealed class MediaCaptureService : IDisposable
             _log.Write("SCAN_SKIPPED", "reason=orders_root_not_set");
             return;
         }
+
+        // Enable CDP network interception (idempotent — only runs once)
+        await EnableCdpAsync();
 
         ScannerStatusChanged?.Invoke("Scanning...");
         UpdateStatus("Scanning chats...");
@@ -295,34 +352,63 @@ public sealed class MediaCaptureService : IDisposable
                     return null;
                 }
                 _log.Write("DATA_URL_DECODED", $"bytes={bytes.Length}");
+                _log.Write("MEDIA_DOWNLOADED", $"bytes={bytes.Length}");
                 return bytes;
             }
 
-            // Source type 2 & 3: blob: or http(s): — fetch via JavaScript
+            // Source type 2 & 3: blob: or http(s): — use CDP Network.getResponseBody
             _log.Write("MEDIA_SOURCE_TYPE", url.StartsWith("blob:") ? "BLOB_URL" : "HTTP_URL");
-            var js = Scripts.FetchImage.Replace("__URL_JSON__", JsonSerializer.Serialize(url));
-            var raw = await _webView.ExecuteScriptAsync(js);
-            var rawShort = raw.Length > 200 ? raw[..200] : raw;
-            _log.Write("DOWNLOAD_SCRIPT_RAW_RESULT", rawShort);
 
-            var node = ParseScriptResult(raw);
-            if (node == null)
+            // Brief delay to ensure network response is fully captured
+            await Task.Delay(500);
+
+            NetworkResponseInfo? info;
+            lock (_networkLock)
             {
-                _log.Write("MEDIA_DOWNLOAD_FAILED", "error=parse_failed");
+                if (!_networkResponses.TryGetValue(url, out info))
+                {
+                    // Fuzzy match by URL prefix (query params may differ)
+                    info = _networkResponses.Values.FirstOrDefault(r =>
+                        url.StartsWith(r.Url, StringComparison.OrdinalIgnoreCase) ||
+                        r.Url.StartsWith(url, StringComparison.OrdinalIgnoreCase));
+                }
+            }
+
+            if (info == null)
+            {
+                var urlShort = url.Length > 80 ? url[..80] : url;
+                _log.Write("MEDIA_FAILURE", $"stage=NETWORK_MATCH reason=no_matching_response url={urlShort}");
                 return null;
             }
 
-            if (node["error"] != null)
+            _log.Write("NETWORK_REQUEST_MATCHED", $"requestId={info.RequestId} url={(url.Length > 80 ? url[..80] : url)}");
+
+            var paramsJson = JsonSerializer.Serialize(new { requestId = info.RequestId });
+            var resultJson = await _webView.CallDevToolsProtocolMethodAsync("Network.getResponseBody", paramsJson);
+
+            using var resultDoc = JsonDocument.Parse(resultJson);
+            var body = resultDoc.RootElement.GetProperty("body").GetString() ?? "";
+            var base64Encoded = resultDoc.RootElement.TryGetProperty("base64Encoded", out var b64) && b64.GetBoolean();
+
+            if (string.IsNullOrEmpty(body))
             {
-                var error = node["error"]?.GetValue<string>() ?? "unknown";
-                _log.Write("MEDIA_DOWNLOAD_FAILED", $"error={error}");
-                LastErrorChanged?.Invoke($"Download failed: {error}");
+                _log.Write("MEDIA_FAILURE", $"stage=NETWORK_MATCH reason=empty_body url={(url.Length > 80 ? url[..80] : url)}");
                 return null;
             }
 
-            var base64 = node["base64"]?.GetValue<string>() ?? "";
-            if (string.IsNullOrEmpty(base64)) return null;
-            return Convert.FromBase64String(base64);
+            byte[] bytes;
+            if (base64Encoded)
+            {
+                bytes = Convert.FromBase64String(body);
+            }
+            else
+            {
+                bytes = System.Text.Encoding.UTF8.GetBytes(body);
+            }
+
+            _log.Write("RESPONSE_BODY_RECEIVED", $"bytes={bytes.Length} base64Encoded={base64Encoded}");
+            _log.Write("MEDIA_DOWNLOADED", $"bytes={bytes.Length}");
+            return bytes;
         }
         catch (Exception ex)
         {
@@ -420,6 +506,13 @@ public sealed class MediaCaptureService : IDisposable
 
     public void Dispose()
     {
+    }
+
+    private sealed class NetworkResponseInfo
+    {
+        public string RequestId { get; set; } = "";
+        public string MimeType { get; set; } = "";
+        public string Url { get; set; } = "";
     }
 
     private static class Scripts
