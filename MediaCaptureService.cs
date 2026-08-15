@@ -64,6 +64,24 @@ public sealed class MediaCaptureService : IDisposable
         _log.Write("CHAT_ROWS_FOUND", chatRowsFound.ToString());
         _log.Write("UNREAD_MARKERS_FOUND", unreadMarkersFound.ToString());
         _log.Write("UNREAD_CHAT_MATCHES", unreadCount.ToString());
+
+        // Marker ancestry diagnostics (when marker found but not associated)
+        if (unreadMarkersFound > 0)
+        {
+            var markerHtml = node?["markerHtml"]?.GetValue<string>() ?? "";
+            var parent1 = node?["parent1"]?.GetValue<string>() ?? "";
+            var parent2 = node?["parent2"]?.GetValue<string>() ?? "";
+            var parent3 = node?["parent3"]?.GetValue<string>() ?? "";
+            var matchedChatRow = node?["matchedChatRow"]?.GetValue<bool>() ?? false;
+            var matchedChatName = node?["matchedChatName"]?.GetValue<string>() ?? "";
+            _log.Write("UNREAD_MARKER_HTML", markerHtml);
+            _log.Write("PARENT_1", parent1);
+            _log.Write("PARENT_2", parent2);
+            _log.Write("PARENT_3", parent3);
+            _log.Write("MATCHED_CHAT_ROW", matchedChatRow.ToString());
+            _log.Write("MATCHED_CHAT_NAME", matchedChatName);
+        }
+
         UnreadChatsChanged?.Invoke(unreadCount);
 
         if (chats == null || chats.Count == 0)
@@ -132,7 +150,9 @@ public sealed class MediaCaptureService : IDisposable
             ImagesDetectedChanged?.Invoke(images.Count);
             var detected = images.Count;
             var saved = 0;
+            var downloaded = 0;
             var duplicates = 0;
+            var failed = 0;
 
             var chatId = $"{customerName}|{phone}";
             var orderFolderBase = _db.GetOrderFolderBase(chatId);
@@ -140,16 +160,24 @@ public sealed class MediaCaptureService : IDisposable
             foreach (var image in images)
             {
                 var src = image?["src"]?.GetValue<string>() ?? "";
-                if (string.IsNullOrWhiteSpace(src)) continue;
+                if (string.IsNullOrWhiteSpace(src))
+                {
+                    failed++;
+                    _log.Write("MEDIA_FAILURE", "stage=SRC reason=empty_src");
+                    continue;
+                }
+                var srcShort = src.Length > 80 ? src[..80] : src;
 
                 // Download real image bytes via JavaScript fetch
                 var imageBytes = await DownloadImageAsync(src);
                 if (imageBytes == null || imageBytes.Length == 0)
                 {
-                    _log.Write("MEDIA_DOWNLOADED", "result=FAILED");
+                    failed++;
+                    _log.Write("MEDIA_FAILURE", $"stage=DOWNLOAD reason=download_failed src={srcShort}");
                     continue;
                 }
 
+                downloaded++;
                 _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length}");
 
                 // Compute SHA-256 for dedup
@@ -167,49 +195,66 @@ public sealed class MediaCaptureService : IDisposable
 
                 // Find or create customer folder
                 string folderPath;
-                if (orderFolderBase != null)
+                try
                 {
-                    var existing = CustomerFolderService.FindExistingFolder(orderFolderBase);
-                    folderPath = existing ?? CustomerFolderService.CreateOrderFolder(_ordersRoot, customerName, phone);
+                    if (orderFolderBase != null)
+                    {
+                        var existing = CustomerFolderService.FindExistingFolder(orderFolderBase);
+                        folderPath = existing ?? CustomerFolderService.CreateOrderFolder(_ordersRoot, customerName, phone);
+                    }
+                    else
+                    {
+                        folderPath = CustomerFolderService.CreateOrderFolder(_ordersRoot, customerName, phone);
+                        orderFolderBase = CustomerFolderService.GetOrderFolderBase(_ordersRoot, customerName, phone);
+                    }
                 }
-                else
+                catch (Exception ex)
                 {
-                    folderPath = CustomerFolderService.CreateOrderFolder(_ordersRoot, customerName, phone);
-                    orderFolderBase = CustomerFolderService.GetOrderFolderBase(_ordersRoot, customerName, phone);
+                    failed++;
+                    _log.Write("MEDIA_FAILURE", $"stage=FOLDER reason={ex.Message} src={srcShort}");
+                    continue;
                 }
 
                 // Save image file
-                var imageIndex = CustomerFolderService.GetNextImageIndex(folderPath);
-                var localPath = CustomerFolderService.SaveImage(folderPath, imageBytes, imageIndex);
-                _log.Write("FILE_SAVED", $"path={localPath}");
-                LastSavedFileChanged?.Invoke(localPath);
+                try
+                {
+                    var imageIndex = CustomerFolderService.GetNextImageIndex(folderPath);
+                    var localPath = CustomerFolderService.SaveImage(folderPath, imageBytes, imageIndex);
+                    _log.Write("FILE_SAVED", $"path={localPath}");
+                    LastSavedFileChanged?.Invoke(localPath);
 
-                // Update folder count (rename folder to match actual file count)
-                var actualFolder = CustomerFolderService.UpdateFolderCount(folderPath);
-                var newCount = CustomerFolderService.CountFiles(actualFolder);
-                _log.Write("CUSTOMER_COUNT_UPDATED", $"count={newCount}");
+                    // Update folder count (rename folder to match actual file count)
+                    var actualFolder = CustomerFolderService.UpdateFolderCount(folderPath);
+                    var newCount = CustomerFolderService.CountFiles(actualFolder);
+                    _log.Write("CUSTOMER_COUNT_UPDATED", $"count={newCount}");
 
-                // Insert into database for dedup
-                var mediaId = Guid.NewGuid().ToString("N");
-                _db.InsertMedia(mediaId, chatId, customerName, phone,
-                    DateTime.Now.ToString("o"), sha256, localPath, orderFolderBase);
+                    // Insert into database for dedup
+                    var mediaId = Guid.NewGuid().ToString("N");
+                    _db.InsertMedia(mediaId, chatId, customerName, phone,
+                        DateTime.Now.ToString("o"), sha256, localPath, orderFolderBase);
 
-                saved++;
-                totalSaved++;
-                ImagesSavedChanged?.Invoke(1);
+                    saved++;
+                    totalSaved++;
+                    ImagesSavedChanged?.Invoke(1);
+                }
+                catch (Exception ex)
+                {
+                    failed++;
+                    _log.Write("MEDIA_FAILURE", $"stage=SAVE reason={ex.Message} src={srcShort}");
+                }
             }
 
-            // Reconciliation: detected = saved + duplicates
-            var reconStatus = detected == saved + duplicates ? "OK" : "MISMATCH";
-            _log.Write("RECONCILIATION", $"detected={detected} saved={saved} duplicates={duplicates} status={reconStatus}");
-            if (reconStatus == "MISMATCH")
+            // Reconciliation: detected = saved + duplicates + failed
+            totalDuplicates += duplicates;
+            _log.Write("RECONCILIATION", $"detected={detected} downloaded={downloaded} duplicates={duplicates} saved={saved} failed={failed}");
+            if (detected != saved + duplicates + failed)
             {
-                _log.Write("RECONCILIATION_ERROR", $"detected={detected} saved={saved} duplicates={duplicates}");
-                LastErrorChanged?.Invoke($"Reconciliation mismatch: detected={detected} saved={saved} dup={duplicates}");
+                _log.Write("RECONCILIATION_ERROR", $"detected={detected} downloaded={downloaded} duplicates={duplicates} saved={saved} failed={failed}");
+                LastErrorChanged?.Invoke($"Reconciliation mismatch: detected={detected} downloaded={downloaded} saved={saved} dup={duplicates} failed={failed}");
             }
 
-            CurrentChatChanged?.Invoke($"{customerName} — {saved} new, {duplicates} dup");
-            UpdateStatus($"Processed: {customerName} — {saved} new, {duplicates} dup");
+            CurrentChatChanged?.Invoke($"{customerName} — {saved} new, {duplicates} dup, {failed} failed");
+            UpdateStatus($"Processed: {customerName} — {saved} new, {duplicates} dup, {failed} failed");
         }
 
         _log.Write("SCAN_COMPLETE", $"total_saved={totalSaved} total_duplicates={totalDuplicates}");
@@ -296,7 +341,7 @@ public sealed class MediaCaptureService : IDisposable
         public const string GetUnreadChats = """
             (() => {
                 const pane = document.querySelector('#pane-side');
-                if (!pane) return JSON.stringify({ chats: [], chatRowsFound: 0, unreadMarkersFound: 0 });
+                if (!pane) return JSON.stringify({ chats: [], chatRowsFound: 0, unreadMarkersFound: 0, markerHtml: '', parent1: '', parent2: '', parent3: '', matchedChatRow: false, matchedChatName: '' });
                 
                 var items = pane.querySelectorAll('[role="listitem"]');
                 if (items.length === 0) items = pane.querySelectorAll('[data-testid="cell-frame-container"]');
@@ -306,6 +351,12 @@ public sealed class MediaCaptureService : IDisposable
                 const chatRowsFound = items.length;
                 var unreadMarkersFound = 0;
                 const chats = [];
+                var markerHtml = '';
+                var parent1 = '';
+                var parent2 = '';
+                var parent3 = '';
+                var matchedChatRow = false;
+                var matchedChatName = '';
                 
                 items.forEach(function(item, idx) {
                     var badge = null;
@@ -375,12 +426,41 @@ public sealed class MediaCaptureService : IDisposable
                     
                     if (badge) {
                         unreadMarkersFound++;
+                        
+                        // Try to find name: first within item, then walk UP from badge
                         var nameEl = item.querySelector('span[title]');
-                        var name = nameEl ? nameEl.getAttribute('title') : '';
+                        var name = nameEl ? (nameEl.getAttribute('title') || '') : '';
+                        
+                        if (!name) {
+                            // Walk up from badge to find an ancestor containing span[title]
+                            var walker = badge;
+                            for (var level = 0; level < 10 && walker; level++) {
+                                walker = walker.parentElement;
+                                if (!walker) break;
+                                var titleEl = walker.querySelector('span[title]');
+                                if (titleEl) {
+                                    name = titleEl.getAttribute('title') || '';
+                                    break;
+                                }
+                            }
+                        }
+                        
                         if (unreadCount === 0) {
                             var badgeText = (badge.textContent || '').trim();
                             unreadCount = parseInt(badgeText) || 1;
                         }
+                        
+                        // Collect diagnostics for first marker only
+                        if (unreadMarkersFound === 1) {
+                            markerHtml = (badge.outerHTML || '').substring(0, 300);
+                            var p = badge.parentElement;
+                            if (p) { parent1 = (p.outerHTML || '').substring(0, 300); p = p.parentElement; }
+                            if (p) { parent2 = (p.outerHTML || '').substring(0, 300); p = p.parentElement; }
+                            if (p) { parent3 = (p.outerHTML || '').substring(0, 300); }
+                            matchedChatRow = !!name;
+                            matchedChatName = name || '';
+                        }
+                        
                         if (name) {
                             chats.push({ index: idx, name: name, unreadCount: unreadCount });
                         }
@@ -390,7 +470,13 @@ public sealed class MediaCaptureService : IDisposable
                 return JSON.stringify({ 
                     chats: chats, 
                     chatRowsFound: chatRowsFound, 
-                    unreadMarkersFound: unreadMarkersFound 
+                    unreadMarkersFound: unreadMarkersFound,
+                    markerHtml: markerHtml,
+                    parent1: parent1,
+                    parent2: parent2,
+                    parent3: parent3,
+                    matchedChatRow: matchedChatRow,
+                    matchedChatName: matchedChatName
                 });
             })();
             """;
