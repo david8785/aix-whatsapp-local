@@ -276,8 +276,19 @@ public sealed class MediaCaptureService : IDisposable
         try
         {
             var js = Scripts.FetchImage.Replace("__URL_JSON__", JsonSerializer.Serialize(url));
-            var node = await ExecuteScriptJsonAsync(js);
-            if (node?["error"] != null)
+            var raw = await _webView.ExecuteScriptAsync(js);
+            // Diagnostic: log the raw result to understand the JSON shape
+            var rawShort = raw.Length > 200 ? raw[..200] : raw;
+            _log.Write("DOWNLOAD_SCRIPT_RAW_RESULT", rawShort);
+
+            var node = ParseScriptResult(raw);
+            if (node == null)
+            {
+                _log.Write("MEDIA_DOWNLOAD_FAILED", $"url={url} error=parse_failed");
+                return null;
+            }
+
+            if (node["error"] != null)
             {
                 var error = node["error"]?.GetValue<string>() ?? "unknown";
                 _log.Write("MEDIA_DOWNLOAD_FAILED", $"url={url} error={error}");
@@ -285,7 +296,7 @@ public sealed class MediaCaptureService : IDisposable
                 return null;
             }
 
-            var base64 = node?["base64"]?.GetValue<string>() ?? "";
+            var base64 = node["base64"]?.GetValue<string>() ?? "";
             if (string.IsNullOrEmpty(base64)) return null;
             return Convert.FromBase64String(base64);
         }
@@ -308,15 +319,34 @@ public sealed class MediaCaptureService : IDisposable
         try
         {
             var raw = await _webView.ExecuteScriptAsync(script);
-            var innerJson = JsonSerializer.Deserialize<string>(raw);
-            if (string.IsNullOrEmpty(innerJson)) return null;
-            return JsonNode.Parse(innerJson);
+            if (string.IsNullOrEmpty(raw)) return null;
+            return ParseScriptResult(raw);
         }
         catch (Exception ex)
         {
             _log.Write("SCRIPT_ERROR", $"error={ex.Message}");
             return null;
         }
+    }
+
+    /// <summary>
+    /// Parse the raw result from ExecuteScriptAsync.
+    /// Sync scripts returning JSON.stringify produce a JSON-encoded string (starts with ").
+    /// Async scripts returning a resolved value may produce raw JSON directly (starts with { or [).
+    /// Handle both cases.
+    /// </summary>
+    private JsonNode? ParseScriptResult(string raw)
+    {
+        var trimmed = raw.Trim();
+        if (trimmed.StartsWith("\""))
+        {
+            // JSON-encoded string — deserialize to get inner JSON, then parse
+            var innerJson = JsonSerializer.Deserialize<string>(raw);
+            if (string.IsNullOrEmpty(innerJson)) return null;
+            return JsonNode.Parse(innerJson);
+        }
+        // Already raw JSON — parse directly
+        return JsonNode.Parse(raw);
     }
 
     private async Task ExecuteScriptAsync(string script)
