@@ -152,27 +152,46 @@ public sealed class MediaCaptureService : IDisposable
         ScannerStatusChanged?.Invoke($"Scanning {chats.Count} chats");
         var totalSaved = 0;
         var totalDuplicates = 0;
+        var chatsProcessed = 0;
+        var maxChats = Math.Min(chats.Count, 20); // Safety limit
 
-        foreach (var chat in chats)
+        // Process unread chats one at a time.
+        // ClickNextUnreadChat finds the first unread badge, resolves the row from
+        // that badge, derives the name from that exact row, and clicks it — all in
+        // the same DOM snapshot. No re-finding by index or text search.
+        while (chatsProcessed < maxChats)
         {
-            var index = chat?["index"]?.GetValue<int>() ?? 0;
-            var name = chat?["name"]?.GetValue<string>() ?? "";
-            if (string.IsNullOrWhiteSpace(name)) continue;
+            var clickNode = await ExecuteScriptJsonAsync(Scripts.ClickNextUnreadChat);
+            var clicked = clickNode?["clicked"]?.GetValue<bool>() ?? false;
+            var name = clickNode?["name"]?.GetValue<string>() ?? "";
+            var clickTargetHtml = clickNode?["clickTargetHtml"]?.GetValue<string>() ?? "";
+            var clickTargetIndex = clickNode?["clickTargetIndex"]?.GetValue<int>() ?? -1;
+            var chatUnreadCount = clickNode?["unreadCount"]?.GetValue<int>() ?? 0;
 
-            var chatUnreadCount = chat?["unreadCount"]?.GetValue<int>() ?? 0;
+            if (!clicked || string.IsNullOrWhiteSpace(name))
+            {
+                _log.Write("NO_MORE_UNREAD", "reason=no_unread_found");
+                break;
+            }
+
+            chatsProcessed++;
+
+            // === CHAT SELECTION VERIFICATION ===
+            // The name and click happen in the SAME script — MATCHED_CHAT_NAME is
+            // derived from the exact row that was clicked.
+            _log.Write("MATCHED_CHAT_NAME", name);
+            _log.Write("CLICK_TARGET_NAME", name);
+            _log.Write("CLICK_TARGET_HTML", (clickTargetHtml.Length > 300 ? clickTargetHtml[..300] : clickTargetHtml));
+            _log.Write("CLICK_TARGET_INDEX", clickTargetIndex.ToString());
             _log.Write("CHAT_NAME", name);
             _log.Write("UNREAD_COUNT", chatUnreadCount.ToString());
+            _log.Write("CHAT_CLICKED", $"name={name}");
             CurrentChatChanged?.Invoke(name);
             UpdateStatus($"Opening: {name}");
 
-            // === CHAT SELECTION VERIFICATION ===
-            // 1. Target chat name captured from the row before click (already in `name`)
-            // 2. Click that exact row
-            _log.Write("CHAT_CLICKED", $"name={name}");
-            await ExecuteScriptAsync(Scripts.OpenChat.Replace("__INDEX__", index.ToString()));
             await Task.Delay(2500); // Wait for conversation panel to load
 
-            // 3 & 4. Read the actual active conversation name from the conversation header
+            // Read the actual active conversation name from the conversation header
             var infoNode = await ExecuteScriptJsonAsync(Scripts.GetCustomerInfo);
             var activeChatName = infoNode?["name"]?.GetValue<string>() ?? "";
             var phone = infoNode?["phone"]?.GetValue<string>() ?? "";
@@ -731,6 +750,132 @@ public sealed class MediaCaptureService : IDisposable
                     return JSON.stringify({ clicked: true, selector: items.length > 0 ? 'cell-frame-container' : 'listitem' });
                 }
                 return JSON.stringify({ clicked: false, reason: 'no_item_at_index', itemCount: items.length });
+            })();
+            """;
+
+        /// <summary>
+        /// Find the first unread badge, resolve the row from that badge via
+        /// badge.closest('[data-testid="cell-frame-container"]'), derive the chat
+        /// name from that exact row, and click it — all in the same DOM snapshot.
+        ///
+        /// This guarantees the same DOM node used to derive MATCHED_CHAT_NAME is
+        /// the exact node whose row is clicked. No re-finding by index or text.
+        /// </summary>
+        public const string ClickNextUnreadChat = """
+            (() => {
+                const pane = document.querySelector('#pane-side');
+                if (!pane) return JSON.stringify({ clicked: false, reason: 'no_pane', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0 });
+
+                var items = pane.querySelectorAll('[data-testid="cell-frame-container"]');
+                if (items.length === 0) items = pane.querySelectorAll('[role="listitem"]');
+                if (items.length === 0) items = pane.querySelectorAll('div[data-id]');
+
+                for (var idx = 0; idx < items.length; idx++) {
+                    var item = items[idx];
+                    var badge = null;
+                    var unreadCount = 0;
+
+                    // Badge detection — same logic as GetUnreadChats
+                    badge = item.querySelector('span[aria-label*="unread" i]');
+                    if (!badge) badge = item.querySelector('div[aria-label*="unread" i]');
+                    if (!badge) badge = item.querySelector('span[aria-label*="הודעות"]');
+                    if (!badge) badge = item.querySelector('[data-testid*="unread" i]');
+
+                    if (!badge) {
+                        var spans = item.querySelectorAll('span');
+                        for (var i = 0; i < spans.length; i++) {
+                            var sp = spans[i];
+                            var t = (sp.textContent || '').trim();
+                            if (/^\d+$/.test(t) && t.length <= 3 && sp.offsetWidth > 0 && sp.offsetWidth <= 30) {
+                                var st = window.getComputedStyle(sp);
+                                var bg = st.backgroundColor;
+                                if (bg && (bg.indexOf('37, 211, 102') >= 0 || bg.indexOf('25, 211, 102') >= 0 || bg.indexOf('37,211,102') >= 0 || bg.indexOf('25,211,102') >= 0)) {
+                                    badge = sp;
+                                    unreadCount = parseInt(t);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!badge) {
+                        var spans2 = item.querySelectorAll('span');
+                        for (var j = 0; j < spans2.length; j++) {
+                            var sp2 = spans2[j];
+                            var t2 = (sp2.textContent || '').trim();
+                            if (/^\d+$/.test(t2) && t2.length <= 3 && sp2.offsetWidth > 0 && sp2.offsetWidth <= 30) {
+                                var rect = sp2.getBoundingClientRect();
+                                var itemRect = item.getBoundingClientRect();
+                                if (rect.right > itemRect.right - 60 && rect.width > 0) {
+                                    badge = sp2;
+                                    unreadCount = parseInt(t2);
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (!badge) {
+                        var allEls = item.querySelectorAll('span, div');
+                        for (var k = 0; k < allEls.length; k++) {
+                            var el = allEls[k];
+                            var stl = window.getComputedStyle(el);
+                            var bgc = stl.backgroundColor;
+                            if (bgc && (bgc.indexOf('37, 211, 102') >= 0 || bgc.indexOf('25, 211, 102') >= 0 || bgc.indexOf('37,211,102') >= 0)) {
+                                if (el.offsetWidth > 0 && el.offsetWidth <= 25 && el.offsetHeight <= 25) {
+                                    var elText = (el.textContent || '').trim();
+                                    badge = el;
+                                    unreadCount = elText ? parseInt(elText) : 1;
+                                    break;
+                                }
+                            }
+                        }
+                    }
+
+                    if (badge) {
+                        // Resolve the row from the badge — the EXACT row that has the unread marker
+                        var row = badge.closest('[data-testid="cell-frame-container"]') ||
+                                  badge.closest('[role="listitem"]') ||
+                                  item;
+
+                        // Derive name from that exact row
+                        var nameEl = row.querySelector('span[title]');
+                        var name = nameEl ? (nameEl.getAttribute('title') || '') : '';
+
+                        if (!name) {
+                            var walker = badge;
+                            for (var level = 0; level < 10 && walker; level++) {
+                                walker = walker.parentElement;
+                                if (!walker) break;
+                                var titleEl = walker.querySelector('span[title]');
+                                if (titleEl) {
+                                    name = titleEl.getAttribute('title') || '';
+                                    break;
+                                }
+                            }
+                        }
+
+                        if (name) {
+                            if (unreadCount === 0) {
+                                var badgeText = (badge.textContent || '').trim();
+                                unreadCount = parseInt(badgeText) || 1;
+                            }
+
+                            // Click that exact row
+                            row.click();
+
+                            return JSON.stringify({
+                                clicked: true,
+                                name: name,
+                                clickTargetHtml: (row.outerHTML || '').substring(0, 300),
+                                clickTargetIndex: idx,
+                                unreadCount: unreadCount
+                            });
+                        }
+                    }
+                }
+
+                return JSON.stringify({ clicked: false, reason: 'no_unread', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0 });
             })();
             """;
 
