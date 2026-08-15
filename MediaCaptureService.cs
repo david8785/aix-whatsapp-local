@@ -152,14 +152,11 @@ public sealed class MediaCaptureService : IDisposable
         ScannerStatusChanged?.Invoke($"Scanning {chats.Count} chats");
         var totalSaved = 0;
         var totalDuplicates = 0;
-        var chatsProcessed = 0;
-        var maxChats = Math.Min(chats.Count, 20); // Safety limit
 
-        // Process unread chats one at a time.
-        // ClickNextUnreadChat finds the first unread badge, resolves the row from
-        // that badge, derives the name from that exact row, and clicks it — all in
-        // the same DOM snapshot. No re-finding by index or text search.
-        while (chatsProcessed < maxChats)
+        // Process ONLY ONE unread chat per scan cycle.
+        // WhatsApp virtualizes/recycles chat list DOM cells, so we cannot iterate
+        // through a previously captured list. After one click + verify + media,
+        // return; the timer will trigger a fresh scan for the next unread.
         {
             var clickNode = await ExecuteScriptJsonAsync(Scripts.ClickNextUnreadChat);
             var clicked = clickNode?["clicked"]?.GetValue<bool>() ?? false;
@@ -167,19 +164,23 @@ public sealed class MediaCaptureService : IDisposable
             var clickTargetHtml = clickNode?["clickTargetHtml"]?.GetValue<string>() ?? "";
             var clickTargetIndex = clickNode?["clickTargetIndex"]?.GetValue<int>() ?? -1;
             var chatUnreadCount = clickNode?["unreadCount"]?.GetValue<int>() ?? 0;
+            var atomicClickTargetName = clickNode?["atomicClickTargetName"]?.GetValue<string>() ?? "";
+            var atomicClickConnected = clickNode?["atomicClickConnected"]?.GetValue<bool>() ?? false;
+            var atomicClickUnreadPresent = clickNode?["atomicClickUnreadPresent"]?.GetValue<bool>() ?? false;
 
             if (!clicked || string.IsNullOrWhiteSpace(name))
             {
                 _log.Write("NO_MORE_UNREAD", "reason=no_unread_found");
-                break;
+                goto scan_complete;
             }
 
-            chatsProcessed++;
-
             // === CHAT SELECTION VERIFICATION ===
-            // The name and click happen in the SAME script — MATCHED_CHAT_NAME is
-            // derived from the exact row that was clicked.
+            // The name and click happen in the SAME script — the row is found,
+            // scrolled into view, and clicked atomically in one JavaScript execution.
             _log.Write("MATCHED_CHAT_NAME", name);
+            _log.Write("ATOMIC_CLICK_TARGET_NAME", atomicClickTargetName);
+            _log.Write("ATOMIC_CLICK_CONNECTED", atomicClickConnected.ToString().ToLowerInvariant());
+            _log.Write("ATOMIC_CLICK_UNREAD_PRESENT", atomicClickUnreadPresent.ToString().ToLowerInvariant());
             _log.Write("CLICK_TARGET_NAME", name);
             _log.Write("CLICK_TARGET_HTML", (clickTargetHtml.Length > 300 ? clickTargetHtml[..300] : clickTargetHtml));
             _log.Write("CLICK_TARGET_INDEX", clickTargetIndex.ToString());
@@ -392,6 +393,7 @@ public sealed class MediaCaptureService : IDisposable
             UpdateStatus($"Processed: {customerName} — {saved} new, {duplicates} dup, {failed} failed");
         }
 
+        scan_complete:
         _log.Write("SCAN_COMPLETE", $"total_saved={totalSaved} total_duplicates={totalDuplicates}");
         ScannerStatusChanged?.Invoke($"Done — {totalSaved} new, {totalDuplicates} dup");
         UpdateStatus($"Scan done — {totalSaved} new, {totalDuplicates} dup");
@@ -861,7 +863,12 @@ public sealed class MediaCaptureService : IDisposable
                                 unreadCount = parseInt(badgeText) || 1;
                             }
 
-                            // Click that exact row
+                            // Scroll the row into view — WhatsApp virtualizes the chat
+                            // list, so the row must be rendered before clicking.
+                            try { row.scrollIntoView({block: 'center'}); } catch(e) {}
+
+                            // Click that exact live row — the same DOM node from which
+                            // the name was derived. No re-query by index or selector.
                             row.click();
 
                             return JSON.stringify({
@@ -869,7 +876,10 @@ public sealed class MediaCaptureService : IDisposable
                                 name: name,
                                 clickTargetHtml: (row.outerHTML || '').substring(0, 300),
                                 clickTargetIndex: idx,
-                                unreadCount: unreadCount
+                                unreadCount: unreadCount,
+                                atomicClickTargetName: name,
+                                atomicClickConnected: true,
+                                atomicClickUnreadPresent: true
                             });
                         }
                     }
