@@ -253,6 +253,27 @@ public sealed class MediaCaptureService : IDisposable
             // Confirmed correct chat — use verified active name as customer name
             var customerName = activeChatName;
 
+            // === Contact phone discovery ===
+            // GetCustomerInfo found only internal IDs (AC...) in #main data-id.
+            // GetContactPhone scans #pane-side JIDs, #main attributes, visible text,
+            // and as a last resort opens the contact-info panel.
+            var phoneNode = await ExecuteScriptJsonAsync(Scripts.GetContactPhone);
+            var contactPhone = phoneNode?["phone"]?.GetValue<string>() ?? "";
+            var phoneAttrCands = phoneNode?["phoneAttrCandidates"]?.AsArray();
+            var phoneTextCands = phoneNode?["phoneTextCandidates"]?.AsArray();
+            var phoneJidCands = phoneNode?["phoneJidCandidates"]?.AsArray();
+            var contactPanelOpened = phoneNode?["openedContactPanel"]?.GetValue<bool>() ?? false;
+            _log.Write("PHONE_ATTR_CANDIDATES", phoneAttrCands != null ? string.Join(" | ", phoneAttrCands.Select(s => s?.GetValue<string>() ?? "")) : "");
+            _log.Write("PHONE_TEXT_CANDIDATES", phoneTextCands != null ? string.Join(" | ", phoneTextCands.Select(s => s?.GetValue<string>() ?? "")) : "");
+            _log.Write("PHONE_JID_CANDIDATES", phoneJidCands != null ? string.Join(" | ", phoneJidCands.Select(s => s?.GetValue<string>() ?? "")) : "");
+            _log.Write("CONTACT_PANEL_OPENED", contactPanelOpened.ToString().ToLowerInvariant());
+            if (!string.IsNullOrWhiteSpace(contactPhone))
+            {
+                phone = contactPhone;
+                _log.Write("CUSTOMER_PHONE_SOURCE", phoneNode?["phoneSource"]?.GetValue<string>() ?? "contact_phone");
+                _log.Write("CUSTOMER_PHONE", phone);
+            }
+
             // If name looks like a phone number, use it as phone
             if (string.IsNullOrWhiteSpace(phone))
             {
@@ -1137,6 +1158,166 @@ public sealed class MediaCaptureService : IDisposable
                     nameSource: nameSource,
                     mainSpanTitles: mainSpanTitles,
                     mainAriaLabels: mainAriaLabels
+                });
+            })();
+            """;
+
+        public const string GetContactPhone = """
+            (async () => {
+                var phoneAttrCandidates = [];
+                var phoneTextCandidates = [];
+                var phoneJidCandidates = [];
+                var phone = '';
+                var phoneSource = '';
+                var openedContactPanel = false;
+                var activeName = '';
+
+                function extractPhone(s) {
+                    if (!s) return '';
+                    var patterns = [/\+?972[\d\s\-()]{7,15}/, /0?5[\d][\d\s\-()]{6,12}/, /\+[\d][\d\s\-()]{6,14}/];
+                    for (var p = 0; p < patterns.length; p++) {
+                        var m = s.match(patterns[p]);
+                        if (m) {
+                            var digits = m[0].replace(/\D/g, '');
+                            if (digits.length >= 7) return digits;
+                        }
+                    }
+                    return '';
+                }
+
+                function extractPhoneFromJid(jid) {
+                    if (!jid) return '';
+                    var atIdx = jid.indexOf('@');
+                    if (atIdx <= 0) return '';
+                    var local = jid.substring(0, atIdx);
+                    var domain = jid.substring(atIdx + 1);
+                    if (domain === 'c.us' || domain === 's.whatsapp.net') {
+                        if (local.indexOf('true_') === 0) local = local.substring(5);
+                        var digits = local.replace(/\D/g, '');
+                        return digits.length >= 7 ? digits : '';
+                    }
+                    return '';
+                }
+
+                var main = document.querySelector('#main');
+                var header = main ? main.querySelector('header') : null;
+
+                // Get active chat name from header (to match chat list row)
+                if (header) {
+                    var nameSpans = header.querySelectorAll('span[dir="auto"]');
+                    for (var ns = 0; ns < nameSpans.length; ns++) {
+                        var t = (nameSpans[ns].textContent || '').trim();
+                        if (t && t.length > 0 && t.length < 100) { activeName = t; break; }
+                    }
+                }
+
+                // 1. Scan #pane-side (chat list) for data-id — chat JIDs (phone@c.us)
+                var pane = document.querySelector('#pane-side');
+                if (pane) {
+                    var allDataId = pane.querySelectorAll('[data-id]');
+                    for (var i = 0; i < allDataId.length && i < 50; i++) {
+                        var did = allDataId[i].getAttribute('data-id') || '';
+                        if (!did) continue;
+                        phoneAttrCandidates.push('pane:' + did);
+                        var p = extractPhoneFromJid(did);
+                        if (p && phoneJidCandidates.indexOf(p) < 0) phoneJidCandidates.push(p);
+                    }
+                }
+
+                // 2. Scan #main for data-id, data-lid, data-user, data-jid
+                if (main) {
+                    var attrs = ['data-id', 'data-lid', 'data-user', 'data-jid'];
+                    for (var a = 0; a < attrs.length; a++) {
+                        var els = main.querySelectorAll('[' + attrs[a] + ']');
+                        for (var j = 0; j < els.length && j < 20; j++) {
+                            var val = els[j].getAttribute(attrs[a]) || '';
+                            if (!val) continue;
+                            phoneAttrCandidates.push(attrs[a] + ':' + val);
+                            var p2 = extractPhoneFromJid(val);
+                            if (p2 && phoneJidCandidates.indexOf(p2) < 0) phoneJidCandidates.push(p2);
+                        }
+                    }
+                }
+
+                // 3. Scan visible text in #main for phone patterns (+972, 05x)
+                if (main) {
+                    var allText = main.innerText || '';
+                    var lines = allText.split('\n');
+                    for (var t = 0; t < lines.length && t < 100; t++) {
+                        var line = lines[t].trim();
+                        if (line.length === 0 || line.length > 30) continue;
+                        var tp = extractPhone(line);
+                        if (tp) phoneTextCandidates.push(line + ' -> ' + tp);
+                    }
+                }
+
+                // 4. Scan aria-label and title in #main for phone patterns
+                if (main) {
+                    var labeled = main.querySelectorAll('[aria-label], [title]');
+                    for (var l = 0; l < labeled.length && l < 50; l++) {
+                        var al = labeled[l].getAttribute('aria-label') || '';
+                        var ti = labeled[l].getAttribute('title') || '';
+                        var lp = extractPhone(al) || extractPhone(ti);
+                        if (lp) phoneTextCandidates.push('label:' + (al || ti) + ' -> ' + lp);
+                    }
+                }
+
+                // 5. Scan tel: links
+                var telLinks = document.querySelectorAll('a[href^="tel:"]');
+                for (var h = 0; h < telLinks.length; h++) {
+                    var hp = extractPhone(telLinks[h].getAttribute('href') || '');
+                    if (hp) phoneTextCandidates.push('tel:' + hp);
+                }
+
+                // 6. Last resort: open contact-info panel, read phone, close it
+                if (phoneJidCandidates.length === 0 && phoneTextCandidates.length === 0 && header) {
+                    try {
+                        var contactBtn = header.querySelector('div[role="button"]') || header;
+                        contactBtn.click();
+                        openedContactPanel = true;
+                        await new Promise(function(r) { setTimeout(r, 2000); });
+
+                        // Scan the whole document for phone text (panel is a new overlay)
+                        var allSpans = document.querySelectorAll('span[dir="auto"], span[title], [aria-label]');
+                        for (var sp = 0; sp < allSpans.length && sp < 300; sp++) {
+                            var spText = ((allSpans[sp].textContent || '').trim()) || (allSpans[sp].getAttribute('title') || '') || (allSpans[sp].getAttribute('aria-label') || '');
+                            var spp = extractPhone(spText);
+                            if (spp) {
+                                var cand = 'panel:' + spText + ' -> ' + spp;
+                                if (phoneTextCandidates.indexOf(cand) < 0) phoneTextCandidates.push(cand);
+                            }
+                        }
+
+                        // Close the panel — Escape, then close button
+                        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, which: 27, bubbles: true, cancelable: true }));
+                        await new Promise(function(r) { setTimeout(r, 500); });
+                        var closeBtn = document.querySelector('button[aria-label="Close"], button[aria-label*="סגור" i], [data-testid="close"]');
+                        if (closeBtn) closeBtn.click();
+                        await new Promise(function(r) { setTimeout(r, 400); });
+                    } catch(e) {
+                        phoneAttrCandidates.push('panel_error:' + (e.message || ''));
+                    }
+                }
+
+                // Pick best phone — prefer JID, then text
+                if (phoneJidCandidates.length > 0) {
+                    phone = phoneJidCandidates[0];
+                    phoneSource = 'jid';
+                } else if (phoneTextCandidates.length > 0) {
+                    var last = phoneTextCandidates[phoneTextCandidates.length - 1];
+                    var arrowIdx = last.lastIndexOf('->');
+                    phone = arrowIdx >= 0 ? last.substring(arrowIdx + 1).trim() : extractPhone(last);
+                    phoneSource = openedContactPanel ? 'contact_panel' : 'text';
+                }
+
+                return JSON.stringify({
+                    phone: phone,
+                    phoneSource: phoneSource,
+                    phoneAttrCandidates: phoneAttrCandidates,
+                    phoneTextCandidates: phoneTextCandidates,
+                    phoneJidCandidates: phoneJidCandidates,
+                    openedContactPanel: openedContactPanel,
+                    activeName: activeName
                 });
             })();
             """;
