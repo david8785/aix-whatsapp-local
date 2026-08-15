@@ -165,17 +165,36 @@ public sealed class MediaCaptureService : IDisposable
             CurrentChatChanged?.Invoke(name);
             UpdateStatus($"Opening: {name}");
 
-            // Open the chat
+            // === CHAT SELECTION VERIFICATION ===
+            // 1. Target chat name captured from the row before click (already in `name`)
+            // 2. Click that exact row
+            _log.Write("CHAT_CLICKED", $"name={name}");
             await ExecuteScriptAsync(Scripts.OpenChat.Replace("__INDEX__", index.ToString()));
-            await Task.Delay(2500); // Wait for messages to load
+            await Task.Delay(2500); // Wait for conversation panel to load
 
-            // Get customer info from the chat header
+            // 3 & 4. Read the actual active conversation name from the conversation header
             var infoNode = await ExecuteScriptJsonAsync(Scripts.GetCustomerInfo);
-            var customerName = infoNode?["name"]?.GetValue<string>() ?? "";
+            var activeChatName = infoNode?["name"]?.GetValue<string>() ?? "";
             var phone = infoNode?["phone"]?.GetValue<string>() ?? "";
 
-            if (string.IsNullOrWhiteSpace(customerName))
-                customerName = name;
+            _log.Write("ACTIVE_CHAT_READY", $"name={activeChatName}");
+
+            // 5. Compare target vs active
+            var chatMatch = !string.IsNullOrWhiteSpace(activeChatName) &&
+                string.Equals(activeChatName, name, StringComparison.OrdinalIgnoreCase);
+            _log.Write("CHAT_MATCH", chatMatch.ToString().ToLowerInvariant());
+
+            // 6. If mismatch — do not process media
+            if (!chatMatch)
+            {
+                _log.Write("CHAT_OPEN_MISMATCH", $"target={name} active={activeChatName}");
+                CurrentChatChanged?.Invoke($"{name} — mismatch (active: {activeChatName})");
+                UpdateStatus($"Chat mismatch: target={name} active={activeChatName}");
+                continue;
+            }
+
+            // Confirmed correct chat — use verified active name as customer name
+            var customerName = activeChatName;
 
             // If name looks like a phone number, use it as phone
             if (string.IsNullOrWhiteSpace(phone))
