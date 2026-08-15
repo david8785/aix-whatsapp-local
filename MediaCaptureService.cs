@@ -142,7 +142,11 @@ public sealed class MediaCaptureService : IDisposable
             var images = imagesNode?["images"]?.AsArray();
             if (images == null || images.Count == 0)
             {
-                _log.Write("MEDIA_DETECTED", "count=0");
+                var totalImgs = imagesNode?["totalImgs"]?.GetValue<int>() ?? 0;
+                var mainFound = imagesNode?["mainFound"]?.GetValue<bool>() ?? false;
+                var filteredSrc = imagesNode?["filteredSrc"]?.GetValue<int>() ?? 0;
+                var filteredSize = imagesNode?["filteredSize"]?.GetValue<int>() ?? 0;
+                _log.Write("MEDIA_DETECTED", $"count=0 mainFound={mainFound} totalImgs={totalImgs} filteredSrc={filteredSrc} filteredSize={filteredSize}");
                 continue;
             }
 
@@ -514,21 +518,22 @@ public sealed class MediaCaptureService : IDisposable
         public const string DetectImages = """
             (() => {
                 const main = document.querySelector('#main');
-                if (!main) return JSON.stringify({ images: [] });
+                if (!main) return JSON.stringify({ images: [], mainFound: false, totalImgs: 0, filteredSrc: 0, filteredSize: 0 });
                 const imgs = main.querySelectorAll('img');
+                const totalImgs = imgs.length;
                 const images = [];
+                var filteredSrc = 0;
+                var filteredSize = 0;
                 for (const img of imgs) {
                     const src = img.getAttribute('src') || '';
-                    if (!src) continue;
-                    if (src.startsWith('blob:') || src.startsWith('data:') || src.startsWith('http')) {
-                        const w = img.naturalWidth || img.width || 0;
-                        const h = img.naturalHeight || img.height || 0;
-                        if (w > 50 || h > 50 || src.startsWith('data:')) {
-                            images.push({ src: src });
-                        }
-                    }
+                    if (!src) { filteredSrc++; continue; }
+                    if (!src.startsWith('blob:') && !src.startsWith('data:') && !src.startsWith('http')) { filteredSrc++; continue; }
+                    const w = img.naturalWidth || img.width || 0;
+                    const h = img.naturalHeight || img.height || 0;
+                    if (w <= 50 && h <= 50 && !src.startsWith('data:')) { filteredSize++; continue; }
+                    images.push({ src: src });
                 }
-                return JSON.stringify({ images: images });
+                return JSON.stringify({ images: images, mainFound: true, totalImgs: totalImgs, filteredSrc: filteredSrc, filteredSize: filteredSize });
             })();
             """;
 

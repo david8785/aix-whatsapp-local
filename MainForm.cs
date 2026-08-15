@@ -142,6 +142,8 @@ public sealed class MainForm : Form
             Text = value,
             Location = new Point(x2, y),
             Size = new Size(340, 20),
+            AutoSize = false,
+            TextAlign = ContentAlignment.MiddleLeft,
             Font = new Font(Font.FontFamily, 9F, FontStyle.Bold),
             ForeColor = valueColor ?? Color.FromArgb(30, 30, 30),
             BackColor = parent.BackColor,
