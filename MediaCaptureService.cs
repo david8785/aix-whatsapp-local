@@ -568,8 +568,10 @@ public sealed class MediaCaptureService : IDisposable
                 const pane = document.querySelector('#pane-side');
                 if (!pane) return JSON.stringify({ chats: [], chatRowsFound: 0, unreadMarkersFound: 0, markerHtml: '', parent1: '', parent2: '', parent3: '', matchedChatRow: false, matchedChatName: '' });
                 
-                var items = pane.querySelectorAll('[role="listitem"]');
-                if (items.length === 0) items = pane.querySelectorAll('[data-testid="cell-frame-container"]');
+                // Primary selector MUST match OpenChat for index consistency.
+                // cell-frame-container = the actual chat row in WhatsApp Web.
+                var items = pane.querySelectorAll('[data-testid="cell-frame-container"]');
+                if (items.length === 0) items = pane.querySelectorAll('[role="listitem"]');
                 if (items.length === 0) items = pane.querySelectorAll('div[data-id]');
                 if (items.length === 0) items = pane.querySelectorAll('div[role="button"]');
                 
@@ -716,13 +718,19 @@ public sealed class MediaCaptureService : IDisposable
         public const string OpenChat = """
             (() => {
                 const pane = document.querySelector('#pane-side');
-                if (!pane) return JSON.stringify({ clicked: false });
-                const items = pane.querySelectorAll('[role="listitem"]');
+                if (!pane) return JSON.stringify({ clicked: false, reason: 'no_pane' });
+                // Use the SAME selector as GetUnreadChats for index consistency.
+                // Click the cell-frame-container directly — NOT a child badge/element
+                // that might open a drawer or context menu instead of the conversation.
+                var items = pane.querySelectorAll('[data-testid="cell-frame-container"]');
+                if (items.length === 0) items = pane.querySelectorAll('[role="listitem"]');
+                if (items.length === 0) items = pane.querySelectorAll('div[data-id]');
                 if (items[__INDEX__]) {
+                    // Click the row container itself, not a nested element
                     items[__INDEX__].click();
-                    return JSON.stringify({ clicked: true });
+                    return JSON.stringify({ clicked: true, selector: items.length > 0 ? 'cell-frame-container' : 'listitem' });
                 }
-                return JSON.stringify({ clicked: false });
+                return JSON.stringify({ clicked: false, reason: 'no_item_at_index', itemCount: items.length });
             })();
             """;
 
@@ -796,9 +804,12 @@ public sealed class MediaCaptureService : IDisposable
                     if (label) ariaLabels.push(label);
                 }
 
-                // Collect text candidates from the conversation header
+                // Collect text candidates from the conversation header.
+                // ONLY span[dir="auto"] — these hold the contact name.
+                // NOT div[role="button"] — those are action buttons (profile, call, video)
+                // whose textContent is UI labels like "פרטי הפרופיל", "שיחה קולית".
                 var textCandidates = [];
-                var textEls = header.querySelectorAll('span[dir="auto"], span[title], div[role="button"]');
+                var textEls = header.querySelectorAll('span[dir="auto"]');
                 for (var k = 0; k < textEls.length && k < 15; k++) {
                     var text = (textEls[k].textContent || '').trim();
                     if (text && text.length > 0 && text.length < 100) {
@@ -825,34 +836,34 @@ public sealed class MediaCaptureService : IDisposable
                 var nameSource = '';
 
                 // UI labels to reject as contact names (Hebrew + English)
-                var uiPattern = /^(Back|Menu|Search|Call|Video|Info|Send|Attach|Emoji|Mute|Pin|Archive|Delete|Settings|online|typing|פרטי הפרופיל|פרטים|צ'אטים|צ׳אטים|שיחות|סטטוס|ערוצים|קהילות|מדיה|את\/ה|את\\ה|את\/אתה)/i;
+                // Includes: navigation tabs, action buttons, profile/info labels, call/video buttons
+                var uiPattern = /^(Back|Menu|Search|Call|Video|Info|Send|Attach|Emoji|Mute|Pin|Archive|Delete|Settings|online|typing|פרטי הפרופיל|פרטים|צ'אטים|צ׳אטים|שיחות|סטטוס|ערוצים|קהילות|מדיה|את\/ה|את\\ה|את\/אתה|WhatsApp|חיפוש|תפריט|שיחה קולית|שיחת וידאו|הודעה|סמן כלא נקרא|הגדרות|יציאה|חזרה|פתח|סגור|בטל|אישור|ערוך|מחק|העתק|שתף|הורד|קדימה|אחורה)/i;
 
-                // Strategy 1: span[title] — first non-empty, non-UI title
-                for (var t = 0; t < titleSpans.length; t++) {
-                    var title = titleSpans[t].getAttribute('title') || '';
-                    if (title && title.length > 0 && !uiPattern.test(title)) {
-                        name = title;
-                        nameSource = 'span_title';
+                // Strategy 1: text candidate from span[dir="auto"] — FIRST priority.
+                // This is the most reliable source: the contact name is always in a
+                // span[dir="auto"] inside the conversation header.
+                for (var c = 0; c < textCandidates.length; c++) {
+                    var candidate = textCandidates[c];
+                    if (candidate && !uiPattern.test(candidate)) {
+                        name = candidate;
+                        nameSource = 'text_candidate';
                         break;
                     }
                 }
 
-                // Strategy 2: text candidate that's not a UI label (PREFERRED over aria-label)
-                // text candidates come from span[dir="auto"] and span[title] — these hold the
-                // actual contact name (e.g. "מיכל"), while aria-labels often hold UI actions
-                // like "פרטי הפרופיל" (Profile details).
+                // Strategy 2: span[title] — second priority
                 if (!name) {
-                    for (var c = 0; c < textCandidates.length; c++) {
-                        var candidate = textCandidates[c];
-                        if (candidate && !uiPattern.test(candidate)) {
-                            name = candidate;
-                            nameSource = 'text_candidate';
+                    for (var t = 0; t < titleSpans.length; t++) {
+                        var title = titleSpans[t].getAttribute('title') || '';
+                        if (title && title.length > 0 && !uiPattern.test(title)) {
+                            name = title;
+                            nameSource = 'span_title';
                             break;
                         }
                     }
                 }
 
-                // Strategy 3: aria-label that's not a UI button/tab (LAST resort)
+                // Strategy 3: aria-label that's not a UI button/tab (LAST resort — almost never correct)
                 if (!name) {
                     for (var a = 0; a < ariaElements.length; a++) {
                         var label = ariaElements[a].getAttribute('aria-label') || '';
