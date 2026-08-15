@@ -396,19 +396,19 @@ public sealed class MediaCaptureService : IDisposable
                 return null;
             }
 
-            byte[] bytes;
+            byte[] imageBytes;
             if (base64Encoded)
             {
-                bytes = Convert.FromBase64String(body);
+                imageBytes = Convert.FromBase64String(body);
             }
             else
             {
-                bytes = System.Text.Encoding.UTF8.GetBytes(body);
+                imageBytes = System.Text.Encoding.UTF8.GetBytes(body);
             }
 
-            _log.Write("RESPONSE_BODY_RECEIVED", $"bytes={bytes.Length} base64Encoded={base64Encoded}");
-            _log.Write("MEDIA_DOWNLOADED", $"bytes={bytes.Length}");
-            return bytes;
+            _log.Write("RESPONSE_BODY_RECEIVED", $"bytes={imageBytes.Length} base64Encoded={base64Encoded}");
+            _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length}");
+            return imageBytes;
         }
         catch (Exception ex)
         {
