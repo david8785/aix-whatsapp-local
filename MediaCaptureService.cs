@@ -237,7 +237,7 @@ public sealed class MediaCaptureService : IDisposable
                 _log.Write("CHAT_OPEN_MISMATCH", $"target={name} active={activeChatName}");
                 CurrentChatChanged?.Invoke($"{name} — mismatch (active: {activeChatName})");
                 UpdateStatus($"Chat mismatch: target={name} active={activeChatName}");
-                continue;
+                goto scan_complete;
             }
 
             // Confirmed correct chat — use verified active name as customer name
@@ -279,7 +279,7 @@ public sealed class MediaCaptureService : IDisposable
                 var filteredSrc = imagesNode?["filteredSrc"]?.GetValue<int>() ?? 0;
                 var filteredSize = imagesNode?["filteredSize"]?.GetValue<int>() ?? 0;
                 _log.Write("MEDIA_DETECTED", $"count=0 mainFound={mainFound} totalImgs={totalImgs} filteredSrc={filteredSrc} filteredSize={filteredSize} filteredPlaceholder={filteredPlaceholder} filteredDup={filteredDup}");
-                continue;
+                goto scan_complete;
             }
 
             _log.Write("MEDIA_DETECTED", $"count={images.Count}");
