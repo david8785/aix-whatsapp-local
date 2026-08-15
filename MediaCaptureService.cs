@@ -167,6 +167,13 @@ public sealed class MediaCaptureService : IDisposable
             var atomicClickTargetName = clickNode?["atomicClickTargetName"]?.GetValue<string>() ?? "";
             var atomicClickConnected = clickNode?["atomicClickConnected"]?.GetValue<bool>() ?? false;
             var atomicClickUnreadPresent = clickNode?["atomicClickUnreadPresent"]?.GetValue<bool>() ?? false;
+            var activeChatBefore = clickNode?["activeChatBefore"]?.GetValue<string>() ?? "";
+            var activeChatAfter = clickNode?["activeChatAfter"]?.GetValue<string>() ?? "";
+            var navigationConfirmed = clickNode?["navigationConfirmed"]?.GetValue<bool>() ?? false;
+            var clickStrategy = clickNode?["clickStrategy"]?.GetValue<string>() ?? "";
+            var clickElementTag = clickNode?["clickElementTag"]?.GetValue<string>() ?? "";
+            var clickElementRole = clickNode?["clickElementRole"]?.GetValue<string>() ?? "";
+            var clickElementTabindex = clickNode?["clickElementTabindex"]?.GetValue<string>() ?? "";
 
             if (!clicked || string.IsNullOrWhiteSpace(name))
             {
@@ -175,26 +182,34 @@ public sealed class MediaCaptureService : IDisposable
             }
 
             // === CHAT SELECTION VERIFICATION ===
-            // The name and click happen in the SAME script — the row is found,
-            // scrolled into view, and clicked atomically in one JavaScript execution.
             _log.Write("MATCHED_CHAT_NAME", name);
             _log.Write("ATOMIC_CLICK_TARGET_NAME", atomicClickTargetName);
             _log.Write("ATOMIC_CLICK_CONNECTED", atomicClickConnected.ToString().ToLowerInvariant());
             _log.Write("ATOMIC_CLICK_UNREAD_PRESENT", atomicClickUnreadPresent.ToString().ToLowerInvariant());
-            _log.Write("CLICK_TARGET_NAME", name);
-            _log.Write("CLICK_TARGET_HTML", (clickTargetHtml.Length > 300 ? clickTargetHtml[..300] : clickTargetHtml));
-            _log.Write("CLICK_TARGET_INDEX", clickTargetIndex.ToString());
-            _log.Write("CHAT_NAME", name);
-            _log.Write("UNREAD_COUNT", chatUnreadCount.ToString());
+            _log.Write("CLICK_STRATEGY", clickStrategy);
+            _log.Write("CLICK_ELEMENT_TAG", clickElementTag);
+            _log.Write("CLICK_ELEMENT_ROLE", clickElementRole);
+            _log.Write("CLICK_ELEMENT_TABINDEX", clickElementTabindex);
+            _log.Write("ACTIVE_CHAT_BEFORE", activeChatBefore);
+            _log.Write("ACTIVE_CHAT_AFTER", activeChatAfter);
+            _log.Write("NAVIGATION_CONFIRMED", navigationConfirmed.ToString().ToLowerInvariant());
             _log.Write("CHAT_CLICKED", $"name={name}");
             CurrentChatChanged?.Invoke(name);
             UpdateStatus($"Opening: {name}");
 
-            await Task.Delay(2500); // Wait for conversation panel to load
+            // If navigation not confirmed — do not process media
+            if (!navigationConfirmed)
+            {
+                _log.Write("CHAT_OPEN_FAILED", $"target={name} before={activeChatBefore} after={activeChatAfter}");
+                CurrentChatChanged?.Invoke($"{name} — open failed (stayed on {activeChatAfter})");
+                UpdateStatus($"Open failed: target={name} active={activeChatAfter}");
+                goto scan_complete;
+            }
 
-            // Read the actual active conversation name from the conversation header
+            // Navigation confirmed — #main now shows the correct chat.
+            // GetCustomerInfo reads phone/name diagnostics from the verified chat.
             var infoNode = await ExecuteScriptJsonAsync(Scripts.GetCustomerInfo);
-            var activeChatName = infoNode?["name"]?.GetValue<string>() ?? "";
+            var activeChatName = activeChatAfter;
             var phone = infoNode?["phone"]?.GetValue<string>() ?? "";
 
             // Header diagnostics — identify why active name may be empty
@@ -812,9 +827,24 @@ public sealed class MediaCaptureService : IDisposable
         /// the exact node whose row is clicked. No re-finding by index or text.
         /// </summary>
         public const string ClickNextUnreadChat = """
-            (() => {
+            (async () => {
                 const pane = document.querySelector('#pane-side');
-                if (!pane) return JSON.stringify({ clicked: false, reason: 'no_pane', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0 });
+                if (!pane) return JSON.stringify({ clicked: false, reason: 'no_pane', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '' });
+
+                function getActiveChatName() {
+                    var main = document.querySelector('#main');
+                    if (!main) return '';
+                    var header = main.querySelector('header');
+                    if (!header) return '';
+                    var spans = header.querySelectorAll('span[dir="auto"]');
+                    for (var i = 0; i < spans.length; i++) {
+                        var t = (spans[i].textContent || '').trim();
+                        if (t && t.length > 0 && t.length < 100) return t;
+                    }
+                    return '';
+                }
+
+                var activeChatBefore = getActiveChatName();
 
                 var items = pane.querySelectorAll('[data-testid="cell-frame-container"]');
                 if (items.length === 0) items = pane.querySelectorAll('[role="listitem"]');
@@ -883,12 +913,10 @@ public sealed class MediaCaptureService : IDisposable
                     }
 
                     if (badge) {
-                        // Resolve the row from the badge — the EXACT row that has the unread marker
                         var row = badge.closest('[data-testid="cell-frame-container"]') ||
                                   badge.closest('[role="listitem"]') ||
                                   item;
 
-                        // Derive name from that exact row
                         var nameEl = row.querySelector('span[title]');
                         var name = nameEl ? (nameEl.getAttribute('title') || '') : '';
 
@@ -911,13 +939,65 @@ public sealed class MediaCaptureService : IDisposable
                                 unreadCount = parseInt(badgeText) || 1;
                             }
 
-                            // Scroll the row into view — WhatsApp virtualizes the chat
-                            // list, so the row must be rendered before clicking.
                             try { row.scrollIntoView({block: 'center'}); } catch(e) {}
+                            await new Promise(function(r) { setTimeout(r, 200); });
 
-                            // Click that exact live row — the same DOM node from which
-                            // the name was derived. No re-query by index or selector.
-                            row.click();
+                            // Find the truly interactive element inside the row.
+                            // WhatsApp React handlers may be on a descendant with
+                            // role/tabindex, not the outer cell-frame-container.
+                            var clickTarget = row;
+                            var strategy = 'row_click';
+                            var interactive = row.querySelector('[role="button"], [tabindex], a, button');
+                            if (interactive) {
+                                clickTarget = interactive;
+                                strategy = 'interactive_descendant';
+                            }
+
+                            var clickElementTag = clickTarget.tagName;
+                            var clickElementRole = clickTarget.getAttribute('role') || '';
+                            var clickElementTabindex = clickTarget.getAttribute('tabindex') || '';
+
+                            // Dispatch full pointer+mouse event sequence at element center.
+                            // .click() alone does not trigger WhatsApp's React navigation.
+                            var rect = clickTarget.getBoundingClientRect();
+                            var cx = rect.left + rect.width / 2;
+                            var cy = rect.top + rect.height / 2;
+
+                            function fire(type, ctor) {
+                                try {
+                                    var ev = new (ctor || MouseEvent)(type, {
+                                        bubbles: true, cancelable: true, view: window,
+                                        clientX: cx, clientY: cy,
+                                        button: 0, buttons: 1
+                                    });
+                                    clickTarget.dispatchEvent(ev);
+                                } catch(e) {}
+                            }
+
+                            if (window.PointerEvent) {
+                                fire('pointerover', PointerEvent);
+                                fire('pointerenter', PointerEvent);
+                                fire('pointerdown', PointerEvent);
+                            }
+                            fire('mouseover', MouseEvent);
+                            fire('mousedown', MouseEvent);
+                            if (window.PointerEvent) fire('pointerup', PointerEvent);
+                            fire('mouseup', MouseEvent);
+                            try { clickTarget.focus(); } catch(e) {}
+                            fire('click', MouseEvent);
+
+                            // Poll for actual #main navigation — up to 5 seconds.
+                            // Confirm success ONLY when targetChatName == activeChatName.
+                            var activeChatAfter = activeChatBefore;
+                            var navigationConfirmed = false;
+                            for (var poll = 0; poll < 25; poll++) {
+                                await new Promise(function(r) { setTimeout(r, 200); });
+                                activeChatAfter = getActiveChatName();
+                                if (activeChatAfter && activeChatAfter === name) {
+                                    navigationConfirmed = true;
+                                    break;
+                                }
+                            }
 
                             return JSON.stringify({
                                 clicked: true,
@@ -927,13 +1007,20 @@ public sealed class MediaCaptureService : IDisposable
                                 unreadCount: unreadCount,
                                 atomicClickTargetName: name,
                                 atomicClickConnected: true,
-                                atomicClickUnreadPresent: true
+                                atomicClickUnreadPresent: true,
+                                activeChatBefore: activeChatBefore,
+                                activeChatAfter: activeChatAfter,
+                                navigationConfirmed: navigationConfirmed,
+                                clickStrategy: strategy,
+                                clickElementTag: clickElementTag,
+                                clickElementRole: clickElementRole,
+                                clickElementTabindex: clickElementTabindex
                             });
                         }
                     }
                 }
 
-                return JSON.stringify({ clicked: false, reason: 'no_unread', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0 });
+                return JSON.stringify({ clicked: false, reason: 'no_unread', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '' });
             })();
             """;
 
