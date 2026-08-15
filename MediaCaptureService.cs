@@ -177,6 +177,21 @@ public sealed class MediaCaptureService : IDisposable
             var activeChatName = infoNode?["name"]?.GetValue<string>() ?? "";
             var phone = infoNode?["phone"]?.GetValue<string>() ?? "";
 
+            // Header diagnostics — identify why active name may be empty
+            var headerFound = infoNode?["headerFound"]?.GetValue<bool>() ?? false;
+            var headerHtml = infoNode?["headerHtml"]?.GetValue<string>() ?? "";
+            var nameSource = infoNode?["nameSource"]?.GetValue<string>() ?? "";
+            var spanTitles = infoNode?["spanTitles"]?.AsArray();
+            var ariaLabels = infoNode?["ariaLabels"]?.AsArray();
+            var textCandidates = infoNode?["textCandidates"]?.AsArray();
+
+            _log.Write("HEADER_ROOT_FOUND", headerFound.ToString().ToLowerInvariant());
+            _log.Write("HEADER_HTML", (headerHtml.Length > 300 ? headerHtml[..300] : headerHtml));
+            _log.Write("HEADER_SPAN_TITLES", spanTitles != null ? string.Join(" | ", spanTitles.Select(s => s?.GetValue<string>() ?? "")) : "");
+            _log.Write("HEADER_ARIA_LABELS", ariaLabels != null ? string.Join(" | ", ariaLabels.Select(s => s?.GetValue<string>() ?? "")) : "");
+            _log.Write("HEADER_TEXT_CANDIDATES", textCandidates != null ? string.Join(" | ", textCandidates.Select(s => s?.GetValue<string>() ?? "")) : "");
+            _log.Write("ACTIVE_CHAT_NAME_SOURCE", nameSource);
+            _log.Write("ACTIVE_CHAT_NAME", activeChatName);
             _log.Write("ACTIVE_CHAT_READY", $"name={activeChatName}");
 
             // 5. Compare target vs active
@@ -694,18 +709,94 @@ public sealed class MediaCaptureService : IDisposable
 
         public const string GetCustomerInfo = """
             (() => {
-                const header = document.querySelector('header');
-                if (!header) return JSON.stringify({ name: '', phone: '' });
-                const nameEl = header.querySelector('span[title]');
-                const name = nameEl ? nameEl.getAttribute('title') : '';
-                let phone = '';
-                const spans = header.querySelectorAll('span[dir="auto"]');
-                for (const span of spans) {
-                    const text = span.textContent || '';
-                    const match = text.match(/[\+]?\d[\d\s\-()]{7,}/);
+                // Target the CONVERSATION header — inside #main, not the chat-list header
+                var header = document.querySelector('#main header');
+                if (!header) header = document.querySelector('header');
+                if (!header) return JSON.stringify({ name: '', phone: '', headerFound: false, headerHtml: '', spanTitles: [], ariaLabels: [], textCandidates: [], nameSource: '' });
+
+                var headerHtml = (header.outerHTML || '').substring(0, 500);
+
+                // Collect all span[title] elements in header
+                var titleSpans = header.querySelectorAll('span[title]');
+                var spanTitles = [];
+                for (var i = 0; i < titleSpans.length && i < 10; i++) {
+                    spanTitles.push(titleSpans[i].getAttribute('title') || '');
+                }
+
+                // Collect all aria-labels in header
+                var ariaElements = header.querySelectorAll('[aria-label]');
+                var ariaLabels = [];
+                for (var j = 0; j < ariaElements.length && j < 10; j++) {
+                    var label = ariaElements[j].getAttribute('aria-label') || '';
+                    if (label) ariaLabels.push(label);
+                }
+
+                // Collect text candidates — visible text from spans in header
+                var textCandidates = [];
+                var textEls = header.querySelectorAll('span[dir="auto"], span[title], div[role="button"]');
+                for (var k = 0; k < textEls.length && k < 15; k++) {
+                    var text = (textEls[k].textContent || '').trim();
+                    if (text && text.length > 0 && text.length < 100) {
+                        textCandidates.push(text);
+                    }
+                }
+
+                var name = '';
+                var nameSource = '';
+
+                // Strategy 1: span[title] — first non-empty title (most reliable)
+                for (var t = 0; t < titleSpans.length; t++) {
+                    var title = titleSpans[t].getAttribute('title') || '';
+                    if (title && title.length > 0) {
+                        name = title;
+                        nameSource = 'span_title';
+                        break;
+                    }
+                }
+
+                // Strategy 2: aria-label that looks like a contact name (not UI buttons)
+                if (!name) {
+                    for (var a = 0; a < ariaElements.length; a++) {
+                        var label = ariaElements[a].getAttribute('aria-label') || '';
+                        if (label && !label.match(/^(Back|Menu|Search|Call|Video|Info|Send|Attach|Emoji|Mute|Pin|Archive|Delete|Settings)/i)) {
+                            name = label;
+                            nameSource = 'aria_label';
+                            break;
+                        }
+                    }
+                }
+
+                // Strategy 3: first text candidate that's not a known UI label
+                if (!name) {
+                    for (var c = 0; c < textCandidates.length; c++) {
+                        var candidate = textCandidates[c];
+                        if (candidate && !candidate.match(/^(Back|Menu|Search|Call|Video|Info|Send|Attach|Emoji|Mute|Pin|Archive|Delete|Settings|online|typing)/i)) {
+                            name = candidate;
+                            nameSource = 'text_candidate';
+                            break;
+                        }
+                    }
+                }
+
+                // Phone extraction — scan all spans for phone-like patterns
+                var phone = '';
+                var spans = header.querySelectorAll('span[dir="auto"]');
+                for (var s = 0; s < spans.length; s++) {
+                    var text = spans[s].textContent || '';
+                    var match = text.match(/[\+]?\d[\d\s\-()]{7,}/);
                     if (match) { phone = match[0].replace(/[\s\-()]/g, ''); break; }
                 }
-                return JSON.stringify({ name: name, phone: phone });
+
+                return JSON.stringify({
+                    name: name,
+                    phone: phone,
+                    headerFound: true,
+                    headerHtml: headerHtml,
+                    spanTitles: spanTitles,
+                    ariaLabels: ariaLabels,
+                    textCandidates: textCandidates,
+                    nameSource: nameSource
+                });
             })();
             """;
 
