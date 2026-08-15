@@ -140,13 +140,22 @@ public sealed class MediaCaptureService : IDisposable
             // Detect images in the current chat
             var imagesNode = await ExecuteScriptJsonAsync(Scripts.DetectImages);
             var images = imagesNode?["images"]?.AsArray();
+
+            // Log skipped placeholder GIFs and duplicate srcs
+            var filteredPlaceholder = imagesNode?["filteredPlaceholder"]?.GetValue<int>() ?? 0;
+            var filteredDup = imagesNode?["filteredDup"]?.GetValue<int>() ?? 0;
+            if (filteredPlaceholder > 0)
+                _log.Write("MEDIA_SKIPPED", $"reason=placeholder_gif count={filteredPlaceholder}");
+            if (filteredDup > 0)
+                _log.Write("MEDIA_DUPLICATE_SRC", $"count={filteredDup}");
+
             if (images == null || images.Count == 0)
             {
                 var totalImgs = imagesNode?["totalImgs"]?.GetValue<int>() ?? 0;
                 var mainFound = imagesNode?["mainFound"]?.GetValue<bool>() ?? false;
                 var filteredSrc = imagesNode?["filteredSrc"]?.GetValue<int>() ?? 0;
                 var filteredSize = imagesNode?["filteredSize"]?.GetValue<int>() ?? 0;
-                _log.Write("MEDIA_DETECTED", $"count=0 mainFound={mainFound} totalImgs={totalImgs} filteredSrc={filteredSrc} filteredSize={filteredSize}");
+                _log.Write("MEDIA_DETECTED", $"count=0 mainFound={mainFound} totalImgs={totalImgs} filteredSrc={filteredSrc} filteredSize={filteredSize} filteredPlaceholder={filteredPlaceholder} filteredDup={filteredDup}");
                 continue;
             }
 
@@ -275,23 +284,38 @@ public sealed class MediaCaptureService : IDisposable
     {
         try
         {
+            // Source type 1: data URL — bytes are already in the src, parse directly in C#
+            if (url.StartsWith("data:"))
+            {
+                _log.Write("MEDIA_SOURCE_TYPE", "DATA_URL");
+                var bytes = ParseDataUrl(url);
+                if (bytes == null || bytes.Length == 0)
+                {
+                    _log.Write("MEDIA_DOWNLOAD_FAILED", "error=data_url_parse_failed");
+                    return null;
+                }
+                _log.Write("DATA_URL_DECODED", $"bytes={bytes.Length}");
+                return bytes;
+            }
+
+            // Source type 2 & 3: blob: or http(s): — fetch via JavaScript
+            _log.Write("MEDIA_SOURCE_TYPE", url.StartsWith("blob:") ? "BLOB_URL" : "HTTP_URL");
             var js = Scripts.FetchImage.Replace("__URL_JSON__", JsonSerializer.Serialize(url));
             var raw = await _webView.ExecuteScriptAsync(js);
-            // Diagnostic: log the raw result to understand the JSON shape
             var rawShort = raw.Length > 200 ? raw[..200] : raw;
             _log.Write("DOWNLOAD_SCRIPT_RAW_RESULT", rawShort);
 
             var node = ParseScriptResult(raw);
             if (node == null)
             {
-                _log.Write("MEDIA_DOWNLOAD_FAILED", $"url={url} error=parse_failed");
+                _log.Write("MEDIA_DOWNLOAD_FAILED", "error=parse_failed");
                 return null;
             }
 
             if (node["error"] != null)
             {
                 var error = node["error"]?.GetValue<string>() ?? "unknown";
-                _log.Write("MEDIA_DOWNLOAD_FAILED", $"url={url} error={error}");
+                _log.Write("MEDIA_DOWNLOAD_FAILED", $"error={error}");
                 LastErrorChanged?.Invoke($"Download failed: {error}");
                 return null;
             }
@@ -302,8 +326,36 @@ public sealed class MediaCaptureService : IDisposable
         }
         catch (Exception ex)
         {
-            _log.Write("MEDIA_DOWNLOAD_FAILED", $"url={url} error={ex.Message}");
+            _log.Write("MEDIA_DOWNLOAD_FAILED", $"error={ex.Message}");
             LastErrorChanged?.Invoke($"Download exception: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Parse a data URL (data:image/jpeg;base64,...) and return the raw bytes.
+    /// Returns null for non-image types or placeholder GIFs.
+    /// </summary>
+    private static byte[]? ParseDataUrl(string dataUrl)
+    {
+        try
+        {
+            var commaIndex = dataUrl.IndexOf(',');
+            if (commaIndex < 0) return null;
+            var header = dataUrl[..commaIndex]; // e.g. "data:image/jpeg;base64"
+            var base64 = dataUrl[(commaIndex + 1)..];
+
+            // Validate MIME type — only accept image types
+            if (!header.StartsWith("data:image/")) return null;
+
+            // Skip placeholder GIFs (1x1 transparent)
+            if (header.StartsWith("data:image/gif")) return null;
+
+            if (string.IsNullOrEmpty(base64)) return null;
+            return Convert.FromBase64String(base64);
+        }
+        catch
+        {
             return null;
         }
     }
@@ -548,22 +600,30 @@ public sealed class MediaCaptureService : IDisposable
         public const string DetectImages = """
             (() => {
                 const main = document.querySelector('#main');
-                if (!main) return JSON.stringify({ images: [], mainFound: false, totalImgs: 0, filteredSrc: 0, filteredSize: 0 });
+                if (!main) return JSON.stringify({ images: [], mainFound: false, totalImgs: 0, filteredSrc: 0, filteredSize: 0, filteredPlaceholder: 0, filteredDup: 0 });
                 const imgs = main.querySelectorAll('img');
                 const totalImgs = imgs.length;
+                const seen = new Set();
                 const images = [];
                 var filteredSrc = 0;
                 var filteredSize = 0;
+                var filteredPlaceholder = 0;
+                var filteredDup = 0;
                 for (const img of imgs) {
                     const src = img.getAttribute('src') || '';
                     if (!src) { filteredSrc++; continue; }
                     if (!src.startsWith('blob:') && !src.startsWith('data:') && !src.startsWith('http')) { filteredSrc++; continue; }
+                    // Skip 1x1 transparent GIF placeholders
+                    if (src.startsWith('data:image/gif;base64,R0lGODlh')) { filteredPlaceholder++; continue; }
                     const w = img.naturalWidth || img.width || 0;
                     const h = img.naturalHeight || img.height || 0;
                     if (w <= 50 && h <= 50 && !src.startsWith('data:')) { filteredSize++; continue; }
+                    // Deduplicate by src — same image appears multiple times in DOM
+                    if (seen.has(src)) { filteredDup++; continue; }
+                    seen.add(src);
                     images.push({ src: src });
                 }
-                return JSON.stringify({ images: images, mainFound: true, totalImgs: totalImgs, filteredSrc: filteredSrc, filteredSize: filteredSize });
+                return JSON.stringify({ images: images, mainFound: true, totalImgs: totalImgs, filteredSrc: filteredSrc, filteredSize: filteredSize, filteredPlaceholder: filteredPlaceholder, filteredDup: filteredDup });
             })();
             """;
 
