@@ -226,6 +226,16 @@ public sealed class MediaCaptureService : IDisposable
             _log.Write("ACTIVE_CHAT_NAME", activeChatName);
             _log.Write("ACTIVE_CHAT_READY", $"name={activeChatName}");
 
+            // Phone / JID diagnostics
+            _log.Write("CUSTOMER_NAME", activeChatName);
+            var phoneSource = infoNode?["phoneSource"]?.GetValue<string>() ?? "";
+            var dataIds = infoNode?["dataIds"]?.AsArray();
+            var phoneCandidates = infoNode?["phoneCandidates"]?.AsArray();
+            _log.Write("HEADER_DATA_IDS", dataIds != null ? string.Join(" | ", dataIds.Select(s => s?.GetValue<string>() ?? "")) : "");
+            _log.Write("PHONE_CANDIDATES", phoneCandidates != null ? string.Join(" | ", phoneCandidates.Select(s => s?.GetValue<string>() ?? "")) : "");
+            _log.Write("CUSTOMER_PHONE_SOURCE", phoneSource);
+            _log.Write("CUSTOMER_PHONE", phone);
+
             // 5. Compare target vs active
             var chatMatch = !string.IsNullOrWhiteSpace(activeChatName) &&
                 string.Equals(activeChatName, name, StringComparison.OrdinalIgnoreCase);
@@ -264,13 +274,30 @@ public sealed class MediaCaptureService : IDisposable
             var imagesNode = await ExecuteScriptJsonAsync(Scripts.DetectImages);
             var images = imagesNode?["images"]?.AsArray();
 
-            // Log skipped placeholder GIFs and duplicate srcs
+            // Log skipped placeholder GIFs, duplicate srcs, and filtered previews
             var filteredPlaceholder = imagesNode?["filteredPlaceholder"]?.GetValue<int>() ?? 0;
             var filteredDup = imagesNode?["filteredDup"]?.GetValue<int>() ?? 0;
+            var filteredPreview = imagesNode?["filteredPreview"]?.GetValue<int>() ?? 0;
+            var messageGroups = imagesNode?["messageGroups"]?.GetValue<int>() ?? 0;
             if (filteredPlaceholder > 0)
                 _log.Write("MEDIA_SKIPPED", $"reason=placeholder_gif count={filteredPlaceholder}");
             if (filteredDup > 0)
                 _log.Write("MEDIA_DUPLICATE_SRC", $"count={filteredDup}");
+            if (filteredPreview > 0)
+                _log.Write("MEDIA_SKIPPED", $"reason=preview_or_thumbnail count={filteredPreview}");
+
+            // Log classification for every candidate (ORIGINAL/PREVIEW/UNKNOWN)
+            var candidates = imagesNode?["candidates"]?.AsArray();
+            if (candidates != null)
+            {
+                foreach (var c in candidates)
+                {
+                    var cSrc = c?["source"]?.GetValue<string>() ?? "";
+                    var cClass = c?["classification"]?.GetValue<string>() ?? "";
+                    var cBytes = c?["bytes"]?.GetValue<int>() ?? 0;
+                    _log.Write("MEDIA_CLASSIFICATION", $"{cClass} source={cSrc} bytes={cBytes}");
+                }
+            }
 
             if (images == null || images.Count == 0)
             {
@@ -278,11 +305,11 @@ public sealed class MediaCaptureService : IDisposable
                 var mainFound = imagesNode?["mainFound"]?.GetValue<bool>() ?? false;
                 var filteredSrc = imagesNode?["filteredSrc"]?.GetValue<int>() ?? 0;
                 var filteredSize = imagesNode?["filteredSize"]?.GetValue<int>() ?? 0;
-                _log.Write("MEDIA_DETECTED", $"count=0 mainFound={mainFound} totalImgs={totalImgs} filteredSrc={filteredSrc} filteredSize={filteredSize} filteredPlaceholder={filteredPlaceholder} filteredDup={filteredDup}");
+                _log.Write("MEDIA_DETECTED", $"count=0 mainFound={mainFound} totalImgs={totalImgs} filteredSrc={filteredSrc} filteredSize={filteredSize} filteredPlaceholder={filteredPlaceholder} filteredDup={filteredDup} filteredPreview={filteredPreview} messageGroups={messageGroups}");
                 goto scan_complete;
             }
 
-            _log.Write("MEDIA_DETECTED", $"count={images.Count}");
+            _log.Write("MEDIA_DETECTED", $"count={images.Count} messageGroups={messageGroups} filteredPreview={filteredPreview}");
             ImagesDetectedChanged?.Invoke(images.Count);
             var detected = images.Count;
             var saved = 0;
@@ -341,7 +368,7 @@ public sealed class MediaCaptureService : IDisposable
                     else
                     {
                         folderPath = CustomerFolderService.CreateOrderFolder(_ordersRoot, customerName, phone);
-                        orderFolderBase = CustomerFolderService.GetOrderFolderBase(_ordersRoot, customerName, phone);
+                        orderFolderBase = CustomerFolderService.GetBasePathFromFolder(folderPath);
                     }
                 }
                 catch (Exception ex)
@@ -1043,18 +1070,61 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
-                // Phone extraction
+                // === Phone / JID diagnostics ===
+                // WhatsApp Web exposes the contact JID (phone@c.us) in data-id attributes
+                // on message containers and conversation elements inside #main.
+                var dataIds = [];
+                var phoneCandidates = [];
+                if (main) {
+                    var idEls = main.querySelectorAll('[data-id]');
+                    for (var d = 0; d < idEls.length && d < 30; d++) {
+                        var did = idEls[d].getAttribute('data-id') || '';
+                        if (did) dataIds.push(did);
+                    }
+                }
+                if (header) {
+                    var hId = header.getAttribute('data-id') || '';
+                    if (hId) dataIds.unshift('HEADER:' + hId);
+                }
+                // Extract phone numbers from JIDs: format "phone@c.us" or "true_phone@..."
+                for (var di = 0; di < dataIds.length; di++) {
+                    var raw = dataIds[di].replace(/^HEADER:/, '');
+                    var atIdx = raw.indexOf('@');
+                    if (atIdx > 0) {
+                        var localPart = raw.substring(0, atIdx);
+                        var domain = raw.substring(atIdx + 1);
+                        if (domain === 'c.us' || domain === 's.whatsapp.net') {
+                            if (localPart.indexOf('true_') === 0) localPart = localPart.substring(5);
+                            var digitsOnly = localPart.replace(/\D/g, '');
+                            if (digitsOnly.length >= 7) {
+                                phoneCandidates.push(digitsOnly);
+                            }
+                        }
+                    }
+                }
+
+                // Phone extraction — prefer JID, fall back to header text
                 var phone = '';
-                var spans = header.querySelectorAll('span[dir="auto"]');
-                for (var s = 0; s < spans.length; s++) {
-                    var text = spans[s].textContent || '';
-                    var match = text.match(/[\+]?\d[\d\s\-()]{7,}/);
-                    if (match) { phone = match[0].replace(/[\s\-()]/g, ''); break; }
+                var phoneSource = '';
+                if (phoneCandidates.length > 0) {
+                    phone = phoneCandidates[0];
+                    phoneSource = 'jid_data_id';
+                }
+                if (!phone) {
+                    var spans = header.querySelectorAll('span[dir="auto"]');
+                    for (var s = 0; s < spans.length; s++) {
+                        var text = spans[s].textContent || '';
+                        var match = text.match(/[\+]?\d[\d\s\-()]{7,}/);
+                        if (match) { phone = match[0].replace(/[\s\-()]/g, ''); phoneSource = 'header_text'; break; }
+                    }
                 }
 
                 return JSON.stringify({
                     name: name,
                     phone: phone,
+                    phoneSource: phoneSource,
+                    dataIds: dataIds,
+                    phoneCandidates: phoneCandidates,
                     mainFound: mainFound,
                     mainHtml: mainHtml,
                     mainHeadersFound: mainHeadersFound,
@@ -1074,30 +1144,87 @@ public sealed class MediaCaptureService : IDisposable
         public const string DetectImages = """
             (() => {
                 const main = document.querySelector('#main');
-                if (!main) return JSON.stringify({ images: [], mainFound: false, totalImgs: 0, filteredSrc: 0, filteredSize: 0, filteredPlaceholder: 0, filteredDup: 0 });
+                if (!main) return JSON.stringify({ images: [], candidates: [], mainFound: false, totalImgs: 0, filteredSrc: 0, filteredSize: 0, filteredPlaceholder: 0, filteredDup: 0, filteredPreview: 0, messageGroups: 0 });
                 const imgs = main.querySelectorAll('img');
                 const totalImgs = imgs.length;
                 const seen = new Set();
-                const images = [];
+                const allEntries = [];
+                const candidates = [];
+                const messageGroups = new Map();
                 var filteredSrc = 0;
                 var filteredSize = 0;
                 var filteredPlaceholder = 0;
                 var filteredDup = 0;
+
                 for (const img of imgs) {
                     const src = img.getAttribute('src') || '';
                     if (!src) { filteredSrc++; continue; }
                     if (!src.startsWith('blob:') && !src.startsWith('data:') && !src.startsWith('http')) { filteredSrc++; continue; }
                     // Skip 1x1 transparent GIF placeholders
                     if (src.startsWith('data:image/gif;base64,R0lGODlh')) { filteredPlaceholder++; continue; }
+
+                    // Classify source type
+                    let sourceType = 'HTTP';
+                    if (src.startsWith('blob:')) sourceType = 'BLOB';
+                    else if (src.startsWith('data:')) sourceType = 'DATA';
+
+                    // Estimate bytes for DATA URLs (base64 payload)
+                    let estBytes = 0;
+                    if (sourceType === 'DATA') {
+                        const commaIdx = src.indexOf(',');
+                        if (commaIdx > 0) {
+                            const b64 = src.substring(commaIdx + 1);
+                            const padding = (b64.endsWith('==') ? 2 : (b64.endsWith('=') ? 1 : 0));
+                            estBytes = Math.floor((b64.length * 3) / 4) - padding;
+                        }
+                    }
+
+                    // Classify ORIGINAL / PREVIEW / UNKNOWN
+                    // DATA URLs < 30KB are thumbnails/avatars/previews (not customer originals).
+                    // BLOB/HTTP are full-resolution media responses captured by CDP.
+                    let classification = 'UNKNOWN';
+                    if (sourceType === 'DATA') {
+                        classification = (estBytes > 0 && estBytes < 30720) ? 'PREVIEW' : 'UNKNOWN';
+                    } else {
+                        classification = 'ORIGINAL';
+                    }
+
                     const w = img.naturalWidth || img.width || 0;
                     const h = img.naturalHeight || img.height || 0;
-                    if (w <= 50 && h <= 50 && !src.startsWith('data:')) { filteredSize++; continue; }
+                    if (w > 0 && h > 0 && w <= 50 && h <= 50 && sourceType !== 'DATA') { filteredSize++; continue; }
+
                     // Deduplicate by src — same image appears multiple times in DOM
                     if (seen.has(src)) { filteredDup++; continue; }
                     seen.add(src);
-                    images.push({ src: src });
+
+                    // Find message container for message-level correlation
+                    let msgEl = img.closest('[data-id]') || img.closest('[data-testid="msg-bubble"]') || null;
+                    let msgId = msgEl ? (msgEl.getAttribute('data-id') || msgEl.getAttribute('data-testid') || '') : '';
+                    if (!msgId) msgId = 'nomsg_' + allEntries.length;
+
+                    const entry = { src: src, source: sourceType, bytes: estBytes, classification: classification, width: w, height: h, messageId: msgId };
+                    allEntries.push(entry);
+                    candidates.push({ source: sourceType, classification: classification, bytes: estBytes, messageId: msgId });
+                    if (!messageGroups.has(msgId)) messageGroups.set(msgId, []);
+                    messageGroups.get(msgId).push(entry);
                 }
-                return JSON.stringify({ images: images, mainFound: true, totalImgs: totalImgs, filteredSrc: filteredSrc, filteredSize: filteredSize, filteredPlaceholder: filteredPlaceholder, filteredDup: filteredDup });
+
+                // Message-level correlation:
+                // - Drop PREVIEW (small DATA thumbnails) — never customer originals.
+                // - If an ORIGINAL (BLOB/HTTP) exists in the same message, also drop
+                //   UNKNOWN (large DATA) entries for that message — the blob is the real photo.
+                const images = [];
+                var filteredPreview = 0;
+                for (const [msgId, group] of messageGroups) {
+                    const hasOriginal = group.some(e => e.classification === 'ORIGINAL');
+                    for (const e of group) {
+                        if (e.classification === 'PREVIEW') { filteredPreview++; continue; }
+                        if (e.classification === 'UNKNOWN' && hasOriginal) { filteredPreview++; continue; }
+                        images.push(e);
+                    }
+                }
+
+                return JSON.stringify({ images: images, candidates: candidates, mainFound: true, totalImgs: totalImgs, filteredSrc: filteredSrc, filteredSize: filteredSize, filteredPlaceholder: filteredPlaceholder, filteredDup: filteredDup, filteredPreview: filteredPreview, messageGroups: messageGroups.size });
             })();
             """;
 
