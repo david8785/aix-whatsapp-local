@@ -652,8 +652,15 @@ public sealed class MediaCaptureService : IDisposable
                     if (badge) {
                         unreadMarkersFound++;
                         
-                        // Try to find name: first within item, then walk UP from badge
-                        var nameEl = item.querySelector('span[title]');
+                        // Find the chat row container that holds THIS badge.
+                        // Use closest() to scope the name search to the same cell-frame-container
+                        // as the unread badge — NOT a broader item that may span multiple rows.
+                        var chatRow = badge.closest('[data-testid="cell-frame-container"]') ||
+                                      badge.closest('[role="listitem"]') ||
+                                      item;
+                        
+                        // Get name from the same container as the badge
+                        var nameEl = chatRow.querySelector('span[title]');
                         var name = nameEl ? (nameEl.getAttribute('title') || '') : '';
                         
                         if (!name) {
@@ -818,7 +825,7 @@ public sealed class MediaCaptureService : IDisposable
                 var nameSource = '';
 
                 // UI labels to reject as contact names (Hebrew + English)
-                var uiPattern = /^(Back|Menu|Search|Call|Video|Info|Send|Attach|Emoji|Mute|Pin|Archive|Delete|Settings|online|typing|צ'אטים|צ׳אטים|שיחות|סטטוס|ערוצים|קהילות|מדיה|את\/ה|את\\ה|את\/אתה)/i;
+                var uiPattern = /^(Back|Menu|Search|Call|Video|Info|Send|Attach|Emoji|Mute|Pin|Archive|Delete|Settings|online|typing|פרטי הפרופיל|פרטים|צ'אטים|צ׳אטים|שיחות|סטטוס|ערוצים|קהילות|מדיה|את\/ה|את\\ה|את\/אתה)/i;
 
                 // Strategy 1: span[title] — first non-empty, non-UI title
                 for (var t = 0; t < titleSpans.length; t++) {
@@ -830,25 +837,28 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
-                // Strategy 2: aria-label that's not a UI button/tab
-                if (!name) {
-                    for (var a = 0; a < ariaElements.length; a++) {
-                        var label = ariaElements[a].getAttribute('aria-label') || '';
-                        if (label && !uiPattern.test(label) && !label.match(/^(Back|Menu|Search|Call|Video|Info|Send|Attach|Emoji|Mute|Pin|Archive|Delete|Settings)/i)) {
-                            name = label;
-                            nameSource = 'aria_label';
-                            break;
-                        }
-                    }
-                }
-
-                // Strategy 3: text candidate that's not a UI label
+                // Strategy 2: text candidate that's not a UI label (PREFERRED over aria-label)
+                // text candidates come from span[dir="auto"] and span[title] — these hold the
+                // actual contact name (e.g. "מיכל"), while aria-labels often hold UI actions
+                // like "פרטי הפרופיל" (Profile details).
                 if (!name) {
                     for (var c = 0; c < textCandidates.length; c++) {
                         var candidate = textCandidates[c];
                         if (candidate && !uiPattern.test(candidate)) {
                             name = candidate;
                             nameSource = 'text_candidate';
+                            break;
+                        }
+                    }
+                }
+
+                // Strategy 3: aria-label that's not a UI button/tab (LAST resort)
+                if (!name) {
+                    for (var a = 0; a < ariaElements.length; a++) {
+                        var label = ariaElements[a].getAttribute('aria-label') || '';
+                        if (label && !uiPattern.test(label) && !label.match(/^(Back|Menu|Search|Call|Video|Info|Send|Attach|Emoji|Mute|Pin|Archive|Delete|Settings)/i)) {
+                            name = label;
+                            nameSource = 'aria_label';
                             break;
                         }
                     }
