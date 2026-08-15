@@ -178,7 +178,7 @@ public sealed class MediaCaptureService : IDisposable
             var phone = infoNode?["phone"]?.GetValue<string>() ?? "";
 
             // Header diagnostics — identify why active name may be empty
-            var mainFound = infoNode?["mainFound"]?.GetValue<bool>() ?? false;
+            var mainPanelFound = infoNode?["mainFound"]?.GetValue<bool>() ?? false;
             var mainHtml = infoNode?["mainHtml"]?.GetValue<string>() ?? "";
             var mainHeadersFound = infoNode?["mainHeadersFound"]?.GetValue<int>() ?? 0;
             var headerFound = infoNode?["headerFound"]?.GetValue<bool>() ?? false;
@@ -191,7 +191,7 @@ public sealed class MediaCaptureService : IDisposable
             var mainSpanTitles = infoNode?["mainSpanTitles"]?.AsArray();
             var mainAriaLabels = infoNode?["mainAriaLabels"]?.AsArray();
 
-            _log.Write("MAIN_FOUND", mainFound.ToString().ToLowerInvariant());
+            _log.Write("MAIN_FOUND", mainPanelFound.ToString().ToLowerInvariant());
             _log.Write("MAIN_HTML", (mainHtml.Length > 2000 ? mainHtml[..2000] : mainHtml));
             _log.Write("MAIN_HEADERS_FOUND", mainHeadersFound.ToString());
             _log.Write("HEADER_ROOT_FOUND", headerFound.ToString().ToLowerInvariant());
