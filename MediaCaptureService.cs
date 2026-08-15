@@ -178,18 +178,30 @@ public sealed class MediaCaptureService : IDisposable
             var phone = infoNode?["phone"]?.GetValue<string>() ?? "";
 
             // Header diagnostics — identify why active name may be empty
+            var mainFound = infoNode?["mainFound"]?.GetValue<bool>() ?? false;
+            var mainHtml = infoNode?["mainHtml"]?.GetValue<string>() ?? "";
+            var mainHeadersFound = infoNode?["mainHeadersFound"]?.GetValue<int>() ?? 0;
             var headerFound = infoNode?["headerFound"]?.GetValue<bool>() ?? false;
             var headerHtml = infoNode?["headerHtml"]?.GetValue<string>() ?? "";
+            var headerTestId = infoNode?["headerTestId"]?.GetValue<string>() ?? "";
             var nameSource = infoNode?["nameSource"]?.GetValue<string>() ?? "";
             var spanTitles = infoNode?["spanTitles"]?.AsArray();
             var ariaLabels = infoNode?["ariaLabels"]?.AsArray();
             var textCandidates = infoNode?["textCandidates"]?.AsArray();
+            var mainSpanTitles = infoNode?["mainSpanTitles"]?.AsArray();
+            var mainAriaLabels = infoNode?["mainAriaLabels"]?.AsArray();
 
+            _log.Write("MAIN_FOUND", mainFound.ToString().ToLowerInvariant());
+            _log.Write("MAIN_HTML", (mainHtml.Length > 2000 ? mainHtml[..2000] : mainHtml));
+            _log.Write("MAIN_HEADERS_FOUND", mainHeadersFound.ToString());
             _log.Write("HEADER_ROOT_FOUND", headerFound.ToString().ToLowerInvariant());
-            _log.Write("HEADER_HTML", (headerHtml.Length > 300 ? headerHtml[..300] : headerHtml));
+            _log.Write("HEADER_TESTID", headerTestId);
+            _log.Write("HEADER_HTML", (headerHtml.Length > 500 ? headerHtml[..500] : headerHtml));
             _log.Write("HEADER_SPAN_TITLES", spanTitles != null ? string.Join(" | ", spanTitles.Select(s => s?.GetValue<string>() ?? "")) : "");
             _log.Write("HEADER_ARIA_LABELS", ariaLabels != null ? string.Join(" | ", ariaLabels.Select(s => s?.GetValue<string>() ?? "")) : "");
             _log.Write("HEADER_TEXT_CANDIDATES", textCandidates != null ? string.Join(" | ", textCandidates.Select(s => s?.GetValue<string>() ?? "")) : "");
+            _log.Write("MAIN_SPAN_TITLES", mainSpanTitles != null ? string.Join(" | ", mainSpanTitles.Select(s => s?.GetValue<string>() ?? "")) : "");
+            _log.Write("MAIN_ARIA_LABELS", mainAriaLabels != null ? string.Join(" | ", mainAriaLabels.Select(s => s?.GetValue<string>() ?? "")) : "");
             _log.Write("ACTIVE_CHAT_NAME_SOURCE", nameSource);
             _log.Write("ACTIVE_CHAT_NAME", activeChatName);
             _log.Write("ACTIVE_CHAT_READY", $"name={activeChatName}");
@@ -709,21 +721,67 @@ public sealed class MediaCaptureService : IDisposable
 
         public const string GetCustomerInfo = """
             (() => {
-                // Target the CONVERSATION header — inside #main, not the chat-list header
-                var header = document.querySelector('#main header');
-                if (!header) header = document.querySelector('header');
-                if (!header) return JSON.stringify({ name: '', phone: '', headerFound: false, headerHtml: '', spanTitles: [], ariaLabels: [], textCandidates: [], nameSource: '' });
+                // === #main diagnostics ===
+                var main = document.querySelector('#main');
+                var mainFound = !!main;
+                var mainHtml = main ? (main.outerHTML || '').substring(0, 2500) : '';
+                var mainHeaders = main ? main.querySelectorAll('header') : [];
+                var mainHeadersFound = mainHeaders.length;
 
-                var headerHtml = (header.outerHTML || '').substring(0, 500);
+                // === Find the CONVERSATION header — explicitly NOT chatlist-header ===
+                // Try multiple selectors inside #main, reject any chatlist-header
+                var header = null;
+                if (main) {
+                    // Selector 1: header inside #main that is NOT chatlist-header
+                    var headersInMain = main.querySelectorAll('header');
+                    for (var h = 0; h < headersInMain.length; h++) {
+                        var testId = headersInMain[h].getAttribute('data-testid') || '';
+                        if (testId !== 'chatlist-header') {
+                            header = headersInMain[h];
+                            break;
+                        }
+                    }
+                    // Selector 2: conversation header by data-testid
+                    if (!header) {
+                        header = main.querySelector('header[data-testid="conversation-panel-header"]')
+                            || main.querySelector('header[data-testid="conversation-header"]')
+                            || main.querySelector('header:not([data-testid="chatlist-header"])');
+                    }
+                }
+                // Selector 3: fallback — any header in document that is NOT chatlist-header
+                if (!header) {
+                    var allHeaders = document.querySelectorAll('header');
+                    for (var h2 = 0; h2 < allHeaders.length; h2++) {
+                        var tid = allHeaders[h2].getAttribute('data-testid') || '';
+                        if (tid !== 'chatlist-header') {
+                            header = allHeaders[h2];
+                            break;
+                        }
+                    }
+                }
 
-                // Collect all span[title] elements in header
+                var headerFound = !!header;
+                var headerHtml = header ? (header.outerHTML || '').substring(0, 500) : '';
+                var headerTestId = header ? (header.getAttribute('data-testid') || '') : '';
+
+                if (!header) {
+                    return JSON.stringify({
+                        name: '', phone: '',
+                        mainFound: mainFound, mainHtml: mainHtml, mainHeadersFound: mainHeadersFound,
+                        headerFound: false, headerHtml: '', headerTestId: '',
+                        spanTitles: [], ariaLabels: [], textCandidates: [], nameSource: '',
+                        mainSpanTitles: [], mainAriaLabels: []
+                    });
+                }
+
+                // Collect span[title] from the conversation header
                 var titleSpans = header.querySelectorAll('span[title]');
                 var spanTitles = [];
                 for (var i = 0; i < titleSpans.length && i < 10; i++) {
                     spanTitles.push(titleSpans[i].getAttribute('title') || '');
                 }
 
-                // Collect all aria-labels in header
+                // Collect aria-labels from the conversation header
                 var ariaElements = header.querySelectorAll('[aria-label]');
                 var ariaLabels = [];
                 for (var j = 0; j < ariaElements.length && j < 10; j++) {
@@ -731,7 +789,7 @@ public sealed class MediaCaptureService : IDisposable
                     if (label) ariaLabels.push(label);
                 }
 
-                // Collect text candidates — visible text from spans in header
+                // Collect text candidates from the conversation header
                 var textCandidates = [];
                 var textEls = header.querySelectorAll('span[dir="auto"], span[title], div[role="button"]');
                 for (var k = 0; k < textEls.length && k < 15; k++) {
@@ -741,24 +799,42 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
+                // Also collect span[title] and aria-labels from ALL of #main (fallback)
+                var mainSpanTitles = [];
+                var mainAriaLabels = [];
+                if (main) {
+                    var mTitles = main.querySelectorAll('span[title]');
+                    for (var mt = 0; mt < mTitles.length && mt < 10; mt++) {
+                        mainSpanTitles.push(mTitles[mt].getAttribute('title') || '');
+                    }
+                    var mArias = main.querySelectorAll('[aria-label]');
+                    for (var ma = 0; ma < mArias.length && ma < 10; ma++) {
+                        var ml = mArias[ma].getAttribute('aria-label') || '';
+                        if (ml) mainAriaLabels.push(ml);
+                    }
+                }
+
                 var name = '';
                 var nameSource = '';
 
-                // Strategy 1: span[title] — first non-empty title (most reliable)
+                // UI labels to reject as contact names (Hebrew + English)
+                var uiPattern = /^(Back|Menu|Search|Call|Video|Info|Send|Attach|Emoji|Mute|Pin|Archive|Delete|Settings|online|typing|צ'אטים|צ׳אטים|שיחות|סטטוס|ערוצים|קהילות|מדיה|את\/ה|את\\ה|את\/אתה)/i;
+
+                // Strategy 1: span[title] — first non-empty, non-UI title
                 for (var t = 0; t < titleSpans.length; t++) {
                     var title = titleSpans[t].getAttribute('title') || '';
-                    if (title && title.length > 0) {
+                    if (title && title.length > 0 && !uiPattern.test(title)) {
                         name = title;
                         nameSource = 'span_title';
                         break;
                     }
                 }
 
-                // Strategy 2: aria-label that looks like a contact name (not UI buttons)
+                // Strategy 2: aria-label that's not a UI button/tab
                 if (!name) {
                     for (var a = 0; a < ariaElements.length; a++) {
                         var label = ariaElements[a].getAttribute('aria-label') || '';
-                        if (label && !label.match(/^(Back|Menu|Search|Call|Video|Info|Send|Attach|Emoji|Mute|Pin|Archive|Delete|Settings)/i)) {
+                        if (label && !uiPattern.test(label) && !label.match(/^(Back|Menu|Search|Call|Video|Info|Send|Attach|Emoji|Mute|Pin|Archive|Delete|Settings)/i)) {
                             name = label;
                             nameSource = 'aria_label';
                             break;
@@ -766,11 +842,11 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
-                // Strategy 3: first text candidate that's not a known UI label
+                // Strategy 3: text candidate that's not a UI label
                 if (!name) {
                     for (var c = 0; c < textCandidates.length; c++) {
                         var candidate = textCandidates[c];
-                        if (candidate && !candidate.match(/^(Back|Menu|Search|Call|Video|Info|Send|Attach|Emoji|Mute|Pin|Archive|Delete|Settings|online|typing)/i)) {
+                        if (candidate && !uiPattern.test(candidate)) {
                             name = candidate;
                             nameSource = 'text_candidate';
                             break;
@@ -778,7 +854,20 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
-                // Phone extraction — scan all spans for phone-like patterns
+                // Strategy 4: span[title] from ALL of #main (broader fallback)
+                if (!name && main) {
+                    var mTitles2 = main.querySelectorAll('span[title]');
+                    for (var mt2 = 0; mt2 < mTitles2.length && mt2 < 15; mt2++) {
+                        var mTitle = mTitles2[mt2].getAttribute('title') || '';
+                        if (mTitle && mTitle.length > 0 && !uiPattern.test(mTitle)) {
+                            name = mTitle;
+                            nameSource = 'main_span_title';
+                            break;
+                        }
+                    }
+                }
+
+                // Phone extraction
                 var phone = '';
                 var spans = header.querySelectorAll('span[dir="auto"]');
                 for (var s = 0; s < spans.length; s++) {
@@ -790,12 +879,18 @@ public sealed class MediaCaptureService : IDisposable
                 return JSON.stringify({
                     name: name,
                     phone: phone,
-                    headerFound: true,
+                    mainFound: mainFound,
+                    mainHtml: mainHtml,
+                    mainHeadersFound: mainHeadersFound,
+                    headerFound: headerFound,
                     headerHtml: headerHtml,
+                    headerTestId: headerTestId,
                     spanTitles: spanTitles,
                     ariaLabels: ariaLabels,
                     textCandidates: textCandidates,
-                    nameSource: nameSource
+                    nameSource: nameSource,
+                    mainSpanTitles: mainSpanTitles,
+                    mainAriaLabels: mainAriaLabels
                 });
             })();
             """;
