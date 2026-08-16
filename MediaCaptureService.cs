@@ -152,6 +152,17 @@ public sealed class MediaCaptureService : IDisposable
             _log.Write("SCAN_NO_ROWS", $"reason={reason}");
         }
 
+        // Row HTML diagnostics — dump first 3 chat rows to see actual badge structure
+        if (chatRowsFound > 0 && unreadMarkersFound == 0)
+        {
+            var rowHtml1 = node?["rowHtml1"]?.GetValue<string>() ?? "";
+            var rowHtml2 = node?["rowHtml2"]?.GetValue<string>() ?? "";
+            var rowHtml3 = node?["rowHtml3"]?.GetValue<string>() ?? "";
+            _log.Write("ROW_HTML_1", rowHtml1);
+            _log.Write("ROW_HTML_2", rowHtml2);
+            _log.Write("ROW_HTML_3", rowHtml3);
+        }
+
         // Marker ancestry diagnostics
         if (unreadMarkersFound > 0)
         {
@@ -889,6 +900,11 @@ public sealed class MediaCaptureService : IDisposable
                 var matchedChatRow = false;
                 var matchedChatName = '';
 
+                // Capture first 3 row HTMLs for badge structure diagnostics
+                var rowHtml1 = items.length > 0 ? (items[0].outerHTML || '').substring(0, 800) : '';
+                var rowHtml2 = items.length > 1 ? (items[1].outerHTML || '').substring(0, 800) : '';
+                var rowHtml3 = items.length > 2 ? (items[2].outerHTML || '').substring(0, 800) : '';
+
                 // === Badge detection helper ===
                 function findBadge(item) {
                     var badge = null;
@@ -968,7 +984,7 @@ public sealed class MediaCaptureService : IDisposable
                 }
 
                 if (unreadMarkersFound === 0 || !firstUnreadBadge) {
-                    return JSON.stringify({ clicked: false, reason: 'no_unread', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', chatRowsFound: chatRowsFound, unreadMarkersFound: 0, markerHtml: markerHtml, parent1: parent1, parent2: parent2, parent3: parent3, matchedChatRow: false, matchedChatName: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
+                    return JSON.stringify({ clicked: false, reason: 'no_unread', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', chatRowsFound: chatRowsFound, unreadMarkersFound: 0, markerHtml: markerHtml, parent1: parent1, parent2: parent2, parent3: parent3, matchedChatRow: false, matchedChatName: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false, rowHtml1: rowHtml1, rowHtml2: rowHtml2, rowHtml3: rowHtml3 });
                 }
 
                 // === Resolve row + name from the SAME badge (atomic handoff) ===
