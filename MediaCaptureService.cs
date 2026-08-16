@@ -1625,15 +1625,14 @@ public sealed class MediaCaptureService : IDisposable
             (() => {
                 const main = document.querySelector('#main');
                 if (!main) return JSON.stringify({ images: [], candidates: [], mainFound: false, totalImgs: 0, filteredSrc: 0, filteredSize: 0, filteredPlaceholder: 0, filteredDup: 0, filteredPreview: 0, messageGroups: 0 });
-                // Only select images inside message bubbles — NOT the profile picture
-                // in the conversation header. The header has data-testid="conversation-header"
-                // and contains a 40x40 profile avatar that is NOT customer media.
+                // ONLY include images inside message containers ([data-id] or msg-bubble).
+                // This is the inverse of trying to exclude the profile picture — instead of
+                // guessing where the profile avatar lives, we only capture images that are
+                // definitively inside a message bubble. Profile pictures, call buttons,
+                // stickers, emoji, and all non-message UI images are automatically excluded.
                 const allImgs = main.querySelectorAll('img');
                 const imgs = Array.from(allImgs).filter(function(img) {
-                    // Exclude images inside any header element (profile picture, call buttons, etc.)
-                    if (img.closest('header')) return false;
-                    // Exclude images inside the conversation-info panel / profile drawer
-                    if (img.closest('[data-testid="conversation-info-header"]')) return false;
+                    if (!img.closest('[data-id]') && !img.closest('[data-testid="msg-bubble"]')) return false;
                     return true;
                 });
                 const totalImgs = imgs.length;
