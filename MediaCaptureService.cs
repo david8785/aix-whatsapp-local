@@ -27,6 +27,10 @@ public sealed class MediaCaptureService : IDisposable
     private readonly object _networkLock = new();
     private bool _cdpEnabled;
 
+    // Runtime src dedup — prevents re-downloading the same blob/data URL across scans
+    // within a session (SHA-256 DB dedup handles cross-session; this avoids redundant fetches).
+    private readonly HashSet<string> _processedSrcs = new();
+
     // Events for live dashboard
     public event Action<string>? CaptureStatusChanged;
     public event Action<string>? ScannerStatusChanged;
@@ -216,7 +220,12 @@ public sealed class MediaCaptureService : IDisposable
         await Task.Delay(2000);
         var navNode = await ExecuteScriptJsonAsync(Scripts.VerifyNavigation);
         activeChatAfter = navNode?["activeChatName"]?.GetValue<string>() ?? "";
-        navigationConfirmed = !string.IsNullOrWhiteSpace(activeChatAfter) && activeChatAfter == name;
+        // Fuzzy match — header name may be truncated or differ slightly from chat list title.
+        // Accept if one contains the other (handles truncation + minor formatting differences).
+        navigationConfirmed = !string.IsNullOrWhiteSpace(activeChatAfter) &&
+            (string.Equals(activeChatAfter, name, StringComparison.OrdinalIgnoreCase) ||
+             (name.Length > 3 && activeChatAfter.Contains(name)) ||
+             (activeChatAfter.Length > 3 && name.Contains(activeChatAfter)));
 
         // === CHAT SELECTION VERIFICATION ===
         _log.Write("MATCHED_CHAT_NAME", name);
@@ -288,9 +297,15 @@ public sealed class MediaCaptureService : IDisposable
             _log.Write("CUSTOMER_PHONE_SOURCE", phoneSource);
             _log.Write("CUSTOMER_PHONE", phone);
 
-            // 5. Compare target vs active
+            // 5. Compare target vs active — FUZZY match (contains either direction).
+            // The header name (span[dir="auto"]) may be truncated or formatted
+            // differently from the chat list name (span[title]). Exact match fails
+            // for short names like "Rod" when the header shows "Rod Smith".
+            // Contains check handles truncation + minor formatting differences.
             var chatMatch = !string.IsNullOrWhiteSpace(activeChatName) &&
-                string.Equals(activeChatName, name, StringComparison.OrdinalIgnoreCase);
+                (string.Equals(activeChatName, name, StringComparison.OrdinalIgnoreCase) ||
+                 (name.Length > 2 && activeChatName.Contains(name)) ||
+                 (activeChatName.Length > 2 && name.Contains(activeChatName)));
             _log.Write("CHAT_MATCH", chatMatch.ToString().ToLowerInvariant());
 
             // 6. If mismatch — do not process media
@@ -401,7 +416,11 @@ public sealed class MediaCaptureService : IDisposable
             var failed = 0;
 
             var chatId = $"{customerName}|{phone}";
-            var orderFolderBase = _db.GetOrderFolderBase(chatId);
+            // Compute folder base fresh per scan using DateTime.Now — scopes to current hour.
+            // Previously used DB base which returned OLD hour folders, preventing new hourly
+            // folders from being created. FindExistingFolder still reuses same-hour folders
+            // across scans because the computed base path matches for the same hour.
+            var orderFolderBase = CustomerFolderService.GetOrderFolderBase(_ordersRoot, customerName, phone);
 
             foreach (var image in images)
             {
@@ -413,6 +432,14 @@ public sealed class MediaCaptureService : IDisposable
                     continue;
                 }
                 var srcShort = src.Length > 80 ? src[..80] : src;
+
+                // Runtime dedup — skip src already processed in this session
+                if (_processedSrcs.Contains(src))
+                {
+                    duplicates++;
+                    _log.Write("DUPLICATE_CHECK", $"result=DUPLICATE_SRC src={srcShort}");
+                    continue;
+                }
 
                 // Download real image bytes via JavaScript fetch
                 var imageBytes = await DownloadImageAsync(src);
@@ -426,11 +453,11 @@ public sealed class MediaCaptureService : IDisposable
                 downloaded++;
                 _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length}");
 
-                // Reject very small files (< 5KB) — these are thumbnails/avatars/placeers,
-                // not real customer photos. A typical WhatsApp photo is > 20KB.
-                if (imageBytes.Length < 5120)
+                // Reject small files (< 15KB) — these are thumbnails/avatars/stickers,
+                // not real customer photos. A typical WhatsApp photo is > 30KB.
+                if (imageBytes.Length < 15360)
                 {
-                    _log.Write("MEDIA_SKIPPED", $"reason=too_small bytes={imageBytes.Length} threshold=5120 src={srcShort}");
+                    _log.Write("MEDIA_SKIPPED", $"reason=too_small bytes={imageBytes.Length} threshold=15360 src={srcShort}");
                     continue;
                 }
 
@@ -454,7 +481,16 @@ public sealed class MediaCaptureService : IDisposable
                     if (orderFolderBase != null)
                     {
                         var existing = CustomerFolderService.FindExistingFolder(orderFolderBase);
-                        folderPath = existing ?? CustomerFolderService.CreateOrderFolder(_ordersRoot, customerName, phone);
+                        if (existing != null)
+                        {
+                            folderPath = existing;
+                        }
+                        else
+                        {
+                            // No existing folder in this hour — create one and lock the base
+                            folderPath = CustomerFolderService.CreateOrderFolder(_ordersRoot, customerName, phone);
+                            orderFolderBase = CustomerFolderService.GetBasePathFromFolder(folderPath);
+                        }
                     }
                     else
                     {
@@ -489,6 +525,7 @@ public sealed class MediaCaptureService : IDisposable
 
                     saved++;
                     totalSaved++;
+                    _processedSrcs.Add(src);
                     ImagesSavedChanged?.Invoke(1);
                 }
                 catch (Exception ex)
@@ -1275,6 +1312,13 @@ public sealed class MediaCaptureService : IDisposable
                     if (!main) return '';
                     var header = main.querySelector('header');
                     if (!header) return '';
+                    // Prefer span[title] — holds the full contact name (matches chat list title).
+                    // span[dir="auto"] textContent may be truncated or a UI label.
+                    var titleEl = header.querySelector('span[title]');
+                    if (titleEl) {
+                        var t = (titleEl.getAttribute('title') || '').trim();
+                        if (t) return t;
+                    }
                     var spans = header.querySelectorAll('span[dir="auto"]');
                     for (var i = 0; i < spans.length; i++) {
                         var t = (spans[i].textContent || '').trim();
@@ -1573,12 +1617,22 @@ public sealed class MediaCaptureService : IDisposable
                 var main = document.querySelector('#main');
                 var header = main ? main.querySelector('header') : null;
 
-                // Get active chat name from header (to match chat list row)
+                // Get active chat name from header — prefer span[title] (full name, matches chat list).
+                // Fall back to span[dir="auto"] (first non-empty, < 100 chars).
+                // No UI filter here — GetCustomerInfo already handles that, and over-filtering
+                // risks rejecting valid short names like "Rod".
                 if (header) {
-                    var nameSpans = header.querySelectorAll('span[dir="auto"]');
-                    for (var ns = 0; ns < nameSpans.length; ns++) {
-                        var t = (nameSpans[ns].textContent || '').trim();
-                        if (t && t.length > 0 && t.length < 100) { activeName = t; break; }
+                    var titleEl = header.querySelector('span[title]');
+                    if (titleEl) {
+                        var tn = (titleEl.getAttribute('title') || '').trim();
+                        if (tn) activeName = tn;
+                    }
+                    if (!activeName) {
+                        var nameSpans = header.querySelectorAll('span[dir="auto"]');
+                        for (var ns = 0; ns < nameSpans.length; ns++) {
+                            var t = (nameSpans[ns].textContent || '').trim();
+                            if (t && t.length > 0 && t.length < 100) { activeName = t; break; }
+                        }
                     }
                 }
 
@@ -1593,7 +1647,11 @@ public sealed class MediaCaptureService : IDisposable
                         var row = rows[r];
                         var titleEl = row.querySelector('span[title]');
                         var rowName = titleEl ? (titleEl.getAttribute('title') || '') : '';
-                        if (rowName && rowName === activeName) {
+                        // Fuzzy match — header name may be truncated vs chat list full name.
+                        if (rowName && activeName &&
+                            (rowName === activeName ||
+                             (activeName.length > 2 && rowName.indexOf(activeName) >= 0) ||
+                             (rowName.length > 2 && activeName.indexOf(rowName) >= 0))) {
                             // Found the matching row — extract JID from its data-id
                             var rowJid = row.getAttribute('data-id') || '';
                             if (!rowJid) {
@@ -1856,7 +1914,9 @@ public sealed class MediaCaptureService : IDisposable
 
                     const w = img.naturalWidth || img.width || 0;
                     const h = img.naturalHeight || img.height || 0;
-                    if (w > 0 && h > 0 && w <= 50 && h <= 50 && sourceType !== 'DATA') { filteredSize++; continue; }
+                    // Filter small images (thumbnails/avatars/stickers) — ≤80x80 for ALL types.
+                    // Real customer photos are always > 80x80.
+                    if (w > 0 && h > 0 && w <= 80 && h <= 80) { filteredSize++; continue; }
 
                     // Deduplicate by src — same image appears multiple times in DOM
                     if (seen.has(src)) { filteredDup++; continue; }

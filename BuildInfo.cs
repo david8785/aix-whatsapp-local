@@ -4,7 +4,7 @@ namespace AIXWhatsAppLocal;
 
 public static class BuildInfo
 {
-    public const string Version = "0.2.1";
+    public const string Version = "0.2.2";
     public const string Commit = "dev-local";
     public const string BuildDate = "unknown";
 }
