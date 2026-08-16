@@ -343,6 +343,16 @@ public sealed class MediaCaptureService : IDisposable
             _log.Write("CUSTOMER_IDENTIFIED", $"name={customerName} phone={phone}");
             CurrentChatChanged?.Invoke(customerName);
 
+            // === Scroll chat to trigger image lazy loading ===
+            // WhatsApp Web lazy-loads images — only images scrolled into view get
+            // their blob: URLs loaded. Without scrolling, DetectImages only finds
+            // placeholder GIFs and small DATA URL previews. Scroll to bottom, wait
+            // for images to load, then scroll back to top.
+            await ExecuteScriptJsonAsync(Scripts.ScrollChat);
+            await Task.Delay(3000);
+            await ExecuteScriptJsonAsync(Scripts.ScrollChatTop);
+            await Task.Delay(2000);
+
             // Detect images in the current chat
             var imagesNode = await ExecuteScriptJsonAsync(Scripts.DetectImages);
             var images = imagesNode?["images"]?.AsArray();
@@ -1479,6 +1489,31 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
+                // Strategy: Extract phone from aria-labels in #main.
+                // WhatsApp wraps phone numbers in Unicode directional isolate characters
+                // (U+2066 ⁦, U+2069 ⁩) inside aria-labels like:
+                // "פתיחת פרטי הצ'אט עם אולי  ⁦+972 52-248-1657⁩"
+                // These chars break standard phone regexes — strip them first.
+                if (!phone && main) {
+                    var labeledEls = main.querySelectorAll('[aria-label]');
+                    for (var le = 0; le < labeledEls.length && le < 80; le++) {
+                        var alText = labeledEls[le].getAttribute('aria-label') || '';
+                        if (!alText) continue;
+                        // Strip Unicode directional isolate/format chars
+                        var cleaned = alText.replace(/[\u2066\u2067\u2068\u2069\u202A-\u202E\u200E\u200F]/g, '');
+                        var m = cleaned.match(/\+?[\d][\d\s\-()]{6,14}/);
+                        if (m) {
+                            var digits = m[0].replace(/\D/g, '');
+                            if (digits.length >= 7 && digits.length <= 15) {
+                                phone = digits;
+                                phoneSource = 'aria_label';
+                                phoneCandidates.push(digits);
+                                break;
+                            }
+                        }
+                    }
+                }
+
                 return JSON.stringify({
                     name: name,
                     phone: phone,
@@ -1688,6 +1723,77 @@ public sealed class MediaCaptureService : IDisposable
                     openedContactPanel: openedContactPanel,
                     activeName: activeName
                 });
+            })();
+            """;
+
+        /// <summary>
+        /// Scroll the chat message panel to the bottom to trigger lazy loading
+        /// of all images. WhatsApp only loads blob: URLs for images that have
+        /// been scrolled into view. Without this, DetectImages only finds
+        /// placeholder GIFs and small DATA URL previews.
+        /// </summary>
+        public const string ScrollChat = """
+            (() => {
+                var main = document.querySelector('#main');
+                if (!main) return JSON.stringify({ scrolled: false, reason: 'no_main' });
+
+                // Find the scrollable message container inside #main.
+                // It's the div with scrollHeight > clientHeight.
+                var scrollable = null;
+                var divs = main.querySelectorAll('div');
+                for (var i = 0; i < divs.length; i++) {
+                    var d = divs[i];
+                    if (d.scrollHeight > d.clientHeight + 200 && d.clientHeight > 200) {
+                        scrollable = d;
+                        break;
+                    }
+                }
+
+                if (!scrollable) return JSON.stringify({ scrolled: false, reason: 'no_scrollable' });
+
+                // Scroll to bottom in one jump — triggers lazy loading for all
+                // intermediate images as the browser fires scroll/intersection events.
+                scrollable.scrollTop = scrollable.scrollHeight;
+
+                return JSON.stringify({
+                    scrolled: true,
+                    scrollHeight: scrollable.scrollHeight,
+                    clientHeight: scrollable.clientHeight,
+                    className: (scrollable.className || '').substring(0, 80)
+                });
+            })();
+            """;
+
+        /// <summary>
+        /// Scroll back to top after ScrollChat — ensures top images are also loaded
+        /// and the chat is in a stable state for detection.
+        /// </summary>
+        public const string ScrollChatTop = """
+            (() => {
+                var main = document.querySelector('#main');
+                if (!main) return JSON.stringify({ scrolled: false });
+
+                var scrollable = null;
+                var divs = main.querySelectorAll('div');
+                for (var i = 0; i < divs.length; i++) {
+                    var d = divs[i];
+                    if (d.scrollHeight > d.clientHeight + 200 && d.clientHeight > 200) {
+                        scrollable = d;
+                        break;
+                    }
+                }
+
+                if (scrollable) {
+                    // Scroll to top gradually — step by step to trigger intersection observers
+                    var totalHeight = scrollable.scrollHeight;
+                    var step = Math.max(300, Math.floor(totalHeight / 15));
+                    scrollable.scrollTop = totalHeight; // start at bottom
+                    // The actual gradual scroll happens via multiple C# calls if needed.
+                    // For now, just jump to top.
+                    scrollable.scrollTop = 0;
+                }
+
+                return JSON.stringify({ scrolled: true });
             })();
             """;
 
