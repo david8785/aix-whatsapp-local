@@ -111,18 +111,42 @@ public sealed class MediaCaptureService : IDisposable
         ScannerStatusChanged?.Invoke("Scanning...");
         UpdateStatus("Scanning chats...");
 
-        var node = await ExecuteScriptJsonAsync(Scripts.GetUnreadChats);
-        var chats = node?["chats"]?.AsArray();
+        // === ATOMIC DETECTION + CLICK ===
+        // Previously GetUnreadChats + ClickNextUnreadChat were two separate script
+        // calls. WhatsApp mutated the DOM between them, causing the unread badge
+        // to disappear before the click (UNREAD found then lost in same scan).
+        // Now FindAndClickUnreadChat does detection + click + verify atomically
+        // in a single script execution — the same DOM snapshot that finds the
+        // unread badge also clicks its row.
+        var node = await ExecuteScriptJsonAsync(Scripts.FindAndClickUnreadChat);
         var chatRowsFound = node?["chatRowsFound"]?.GetValue<int>() ?? 0;
         var unreadMarkersFound = node?["unreadMarkersFound"]?.GetValue<int>() ?? 0;
-        var unreadCount = chats?.Count ?? 0;
+        var clicked = node?["clicked"]?.GetValue<bool>() ?? false;
+        var name = node?["name"]?.GetValue<string>() ?? "";
+        var clickTargetHtml = node?["clickTargetHtml"]?.GetValue<string>() ?? "";
+        var clickTargetIndex = node?["clickTargetIndex"]?.GetValue<int>() ?? -1;
+        var chatUnreadCount = node?["unreadCount"]?.GetValue<int>() ?? 0;
+        var atomicClickTargetName = node?["atomicClickTargetName"]?.GetValue<string>() ?? "";
+        var atomicClickConnected = node?["atomicClickConnected"]?.GetValue<bool>() ?? false;
+        var atomicClickUnreadPresent = node?["atomicClickUnreadPresent"]?.GetValue<bool>() ?? false;
+        var activeChatBefore = node?["activeChatBefore"]?.GetValue<string>() ?? "";
+        var activeChatAfter = node?["activeChatAfter"]?.GetValue<string>() ?? "";
+        var navigationConfirmed = node?["navigationConfirmed"]?.GetValue<bool>() ?? false;
+        var clickStrategy = node?["clickStrategy"]?.GetValue<string>() ?? "";
+        var clickElementTag = node?["clickElementTag"]?.GetValue<string>() ?? "";
+        var clickElementRole = node?["clickElementRole"]?.GetValue<string>() ?? "";
+        var clickElementTabindex = node?["clickElementTabindex"]?.GetValue<string>() ?? "";
+        var unreadHandoffName = node?["unreadHandoffName"]?.GetValue<string>() ?? "";
+        var unreadHandoffRowConnected = node?["unreadHandoffRowConnected"]?.GetValue<bool>() ?? false;
+        var unreadHandoffBadgeStillPresent = node?["unreadHandoffBadgeStillPresent"]?.GetValue<bool>() ?? false;
+        var clickAttempted = node?["clickAttempted"]?.GetValue<bool>() ?? false;
 
         // Diagnostic logging
         _log.Write("CHAT_ROWS_FOUND", chatRowsFound.ToString());
         _log.Write("UNREAD_MARKERS_FOUND", unreadMarkersFound.ToString());
-        _log.Write("UNREAD_CHAT_MATCHES", unreadCount.ToString());
+        _log.Write("UNREAD_CHAT_MATCHES", unreadMarkersFound.ToString());
 
-        // Marker ancestry diagnostics (when marker found but not associated)
+        // Marker ancestry diagnostics
         if (unreadMarkersFound > 0)
         {
             var markerHtml = node?["markerHtml"]?.GetValue<string>() ?? "";
@@ -139,78 +163,62 @@ public sealed class MediaCaptureService : IDisposable
             _log.Write("MATCHED_CHAT_NAME", matchedChatName);
         }
 
-        UnreadChatsChanged?.Invoke(unreadCount);
+        UnreadChatsChanged?.Invoke(unreadMarkersFound);
 
-        if (chats == null || chats.Count == 0)
+        if (unreadMarkersFound == 0)
         {
-            ScannerStatusChanged?.Invoke($"Idle — {chatRowsFound} chats, {unreadMarkersFound} markers");
+            ScannerStatusChanged?.Invoke($"Idle — {chatRowsFound} chats, 0 markers");
             UpdateStatus("Idle — no unread chats");
             return;
         }
 
-        _log.Write("SCAN_START", $"unread_chats={chats.Count}");
-        ScannerStatusChanged?.Invoke($"Scanning {chats.Count} chats");
+        _log.Write("SCAN_START", $"unread_chats={unreadMarkersFound}");
+        ScannerStatusChanged?.Invoke($"Scanning {unreadMarkersFound} chats");
         var totalSaved = 0;
         var totalDuplicates = 0;
 
-        // Process ONLY ONE unread chat per scan cycle.
-        // WhatsApp virtualizes/recycles chat list DOM cells, so we cannot iterate
-        // through a previously captured list. After one click + verify + media,
-        // return; the timer will trigger a fresh scan for the next unread.
+        // Handoff diagnostics — proves the row survived between detection and click
+        _log.Write("UNREAD_HANDOFF_NAME", unreadHandoffName);
+        _log.Write("UNREAD_HANDOFF_ROW_CONNECTED", unreadHandoffRowConnected.ToString().ToLowerInvariant());
+        _log.Write("UNREAD_HANDOFF_BADGE_STILL_PRESENT", unreadHandoffBadgeStillPresent.ToString().ToLowerInvariant());
+        _log.Write("CLICK_ATTEMPTED", clickAttempted.ToString().ToLowerInvariant());
+
+        if (!clicked || string.IsNullOrWhiteSpace(name))
         {
-            var clickNode = await ExecuteScriptJsonAsync(Scripts.ClickNextUnreadChat);
-            var clicked = clickNode?["clicked"]?.GetValue<bool>() ?? false;
-            var name = clickNode?["name"]?.GetValue<string>() ?? "";
-            var clickTargetHtml = clickNode?["clickTargetHtml"]?.GetValue<string>() ?? "";
-            var clickTargetIndex = clickNode?["clickTargetIndex"]?.GetValue<int>() ?? -1;
-            var chatUnreadCount = clickNode?["unreadCount"]?.GetValue<int>() ?? 0;
-            var atomicClickTargetName = clickNode?["atomicClickTargetName"]?.GetValue<string>() ?? "";
-            var atomicClickConnected = clickNode?["atomicClickConnected"]?.GetValue<bool>() ?? false;
-            var atomicClickUnreadPresent = clickNode?["atomicClickUnreadPresent"]?.GetValue<bool>() ?? false;
-            var activeChatBefore = clickNode?["activeChatBefore"]?.GetValue<string>() ?? "";
-            var activeChatAfter = clickNode?["activeChatAfter"]?.GetValue<string>() ?? "";
-            var navigationConfirmed = clickNode?["navigationConfirmed"]?.GetValue<bool>() ?? false;
-            var clickStrategy = clickNode?["clickStrategy"]?.GetValue<string>() ?? "";
-            var clickElementTag = clickNode?["clickElementTag"]?.GetValue<string>() ?? "";
-            var clickElementRole = clickNode?["clickElementRole"]?.GetValue<string>() ?? "";
-            var clickElementTabindex = clickNode?["clickElementTabindex"]?.GetValue<string>() ?? "";
+            _log.Write("NO_MORE_UNREAD", "reason=unread_lost_between_detection_and_click");
+            goto scan_complete;
+        }
 
-            if (!clicked || string.IsNullOrWhiteSpace(name))
-            {
-                _log.Write("NO_MORE_UNREAD", "reason=no_unread_found");
-                goto scan_complete;
-            }
+        // === CHAT SELECTION VERIFICATION ===
+        _log.Write("MATCHED_CHAT_NAME", name);
+        _log.Write("ATOMIC_CLICK_TARGET_NAME", atomicClickTargetName);
+        _log.Write("ATOMIC_CLICK_CONNECTED", atomicClickConnected.ToString().ToLowerInvariant());
+        _log.Write("ATOMIC_CLICK_UNREAD_PRESENT", atomicClickUnreadPresent.ToString().ToLowerInvariant());
+        _log.Write("CLICK_STRATEGY", clickStrategy);
+        _log.Write("CLICK_ELEMENT_TAG", clickElementTag);
+        _log.Write("CLICK_ELEMENT_ROLE", clickElementRole);
+        _log.Write("CLICK_ELEMENT_TABINDEX", clickElementTabindex);
+        _log.Write("ACTIVE_CHAT_BEFORE", activeChatBefore);
+        _log.Write("ACTIVE_CHAT_AFTER", activeChatAfter);
+        _log.Write("NAVIGATION_CONFIRMED", navigationConfirmed.ToString().ToLowerInvariant());
+        _log.Write("CHAT_CLICKED", $"name={name}");
+        CurrentChatChanged?.Invoke(name);
+        UpdateStatus($"Opening: {name}");
 
-            // === CHAT SELECTION VERIFICATION ===
-            _log.Write("MATCHED_CHAT_NAME", name);
-            _log.Write("ATOMIC_CLICK_TARGET_NAME", atomicClickTargetName);
-            _log.Write("ATOMIC_CLICK_CONNECTED", atomicClickConnected.ToString().ToLowerInvariant());
-            _log.Write("ATOMIC_CLICK_UNREAD_PRESENT", atomicClickUnreadPresent.ToString().ToLowerInvariant());
-            _log.Write("CLICK_STRATEGY", clickStrategy);
-            _log.Write("CLICK_ELEMENT_TAG", clickElementTag);
-            _log.Write("CLICK_ELEMENT_ROLE", clickElementRole);
-            _log.Write("CLICK_ELEMENT_TABINDEX", clickElementTabindex);
-            _log.Write("ACTIVE_CHAT_BEFORE", activeChatBefore);
-            _log.Write("ACTIVE_CHAT_AFTER", activeChatAfter);
-            _log.Write("NAVIGATION_CONFIRMED", navigationConfirmed.ToString().ToLowerInvariant());
-            _log.Write("CHAT_CLICKED", $"name={name}");
-            CurrentChatChanged?.Invoke(name);
-            UpdateStatus($"Opening: {name}");
+        // If navigation not confirmed — do not process media
+        if (!navigationConfirmed)
+        {
+            _log.Write("CHAT_OPEN_FAILED", $"target={name} before={activeChatBefore} after={activeChatAfter}");
+            CurrentChatChanged?.Invoke($"{name} — open failed (stayed on {activeChatAfter})");
+            UpdateStatus($"Open failed: target={name} active={activeChatAfter}");
+            goto scan_complete;
+        }
 
-            // If navigation not confirmed — do not process media
-            if (!navigationConfirmed)
-            {
-                _log.Write("CHAT_OPEN_FAILED", $"target={name} before={activeChatBefore} after={activeChatAfter}");
-                CurrentChatChanged?.Invoke($"{name} — open failed (stayed on {activeChatAfter})");
-                UpdateStatus($"Open failed: target={name} active={activeChatAfter}");
-                goto scan_complete;
-            }
-
-            // Navigation confirmed — #main now shows the correct chat.
-            // GetCustomerInfo reads phone/name diagnostics from the verified chat.
-            var infoNode = await ExecuteScriptJsonAsync(Scripts.GetCustomerInfo);
-            var activeChatName = activeChatAfter;
-            var phone = infoNode?["phone"]?.GetValue<string>() ?? "";
+        // Navigation confirmed — #main now shows the correct chat.
+        // GetCustomerInfo reads phone/name diagnostics from the verified chat.
+        var infoNode = await ExecuteScriptJsonAsync(Scripts.GetCustomerInfo);
+        var activeChatName = activeChatAfter;
+        var phone = infoNode?["phone"]?.GetValue<string>() ?? "";
 
             // Header diagnostics — identify why active name may be empty
             var mainPanelFound = infoNode?["mainFound"]?.GetValue<bool>() ?? false;
@@ -454,7 +462,6 @@ public sealed class MediaCaptureService : IDisposable
 
             CurrentChatChanged?.Invoke($"{customerName} — {saved} new, {duplicates} dup, {failed} failed");
             UpdateStatus($"Processed: {customerName} — {saved} new, {duplicates} dup, {failed} failed");
-        }
 
         scan_complete:
         _log.Write("SCAN_COMPLETE", $"total_saved={totalSaved} total_duplicates={totalDuplicates}");
@@ -826,10 +833,17 @@ public sealed class MediaCaptureService : IDisposable
         /// This guarantees the same DOM node used to derive MATCHED_CHAT_NAME is
         /// the exact node whose row is clicked. No re-finding by index or text.
         /// </summary>
-        public const string ClickNextUnreadChat = """
+        /// <summary>
+        /// ATOMIC detection + click in a single script execution.
+        /// Previously GetUnreadChats and ClickNextUnreadChat were two separate calls;
+        /// WhatsApp mutated the DOM between them, causing the unread badge to
+        /// disappear before the click. This script finds the unread, clicks it,
+        /// and verifies navigation — all in one DOM snapshot.
+        /// </summary>
+        public const string FindAndClickUnreadChat = """
             (async () => {
                 const pane = document.querySelector('#pane-side');
-                if (!pane) return JSON.stringify({ clicked: false, reason: 'no_pane', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '' });
+                if (!pane) return JSON.stringify({ clicked: false, reason: 'no_pane', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', chatRowsFound: 0, unreadMarkersFound: 0, markerHtml: '', parent1: '', parent2: '', parent3: '', matchedChatRow: false, matchedChatName: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
 
                 function getActiveChatName() {
                     var main = document.querySelector('#main');
@@ -850,17 +864,23 @@ public sealed class MediaCaptureService : IDisposable
                 if (items.length === 0) items = pane.querySelectorAll('[role="listitem"]');
                 if (items.length === 0) items = pane.querySelectorAll('div[data-id]');
 
-                for (var idx = 0; idx < items.length; idx++) {
-                    var item = items[idx];
+                var chatRowsFound = items.length;
+                var unreadMarkersFound = 0;
+                var markerHtml = '';
+                var parent1 = '';
+                var parent2 = '';
+                var parent3 = '';
+                var matchedChatRow = false;
+                var matchedChatName = '';
+
+                // === Badge detection helper ===
+                function findBadge(item) {
                     var badge = null;
                     var unreadCount = 0;
-
-                    // Badge detection — same logic as GetUnreadChats
                     badge = item.querySelector('span[aria-label*="unread" i]');
                     if (!badge) badge = item.querySelector('div[aria-label*="unread" i]');
                     if (!badge) badge = item.querySelector('span[aria-label*="הודעות"]');
                     if (!badge) badge = item.querySelector('[data-testid*="unread" i]');
-
                     if (!badge) {
                         var spans = item.querySelectorAll('span');
                         for (var i = 0; i < spans.length; i++) {
@@ -870,14 +890,11 @@ public sealed class MediaCaptureService : IDisposable
                                 var st = window.getComputedStyle(sp);
                                 var bg = st.backgroundColor;
                                 if (bg && (bg.indexOf('37, 211, 102') >= 0 || bg.indexOf('25, 211, 102') >= 0 || bg.indexOf('37,211,102') >= 0 || bg.indexOf('25,211,102') >= 0)) {
-                                    badge = sp;
-                                    unreadCount = parseInt(t);
-                                    break;
+                                    badge = sp; unreadCount = parseInt(t); break;
                                 }
                             }
                         }
                     }
-
                     if (!badge) {
                         var spans2 = item.querySelectorAll('span');
                         for (var j = 0; j < spans2.length; j++) {
@@ -887,14 +904,11 @@ public sealed class MediaCaptureService : IDisposable
                                 var rect = sp2.getBoundingClientRect();
                                 var itemRect = item.getBoundingClientRect();
                                 if (rect.right > itemRect.right - 60 && rect.width > 0) {
-                                    badge = sp2;
-                                    unreadCount = parseInt(t2);
-                                    break;
+                                    badge = sp2; unreadCount = parseInt(t2); break;
                                 }
                             }
                         }
                     }
-
                     if (!badge) {
                         var allEls = item.querySelectorAll('span, div');
                         for (var k = 0; k < allEls.length; k++) {
@@ -904,123 +918,162 @@ public sealed class MediaCaptureService : IDisposable
                             if (bgc && (bgc.indexOf('37, 211, 102') >= 0 || bgc.indexOf('25, 211, 102') >= 0 || bgc.indexOf('37,211,102') >= 0)) {
                                 if (el.offsetWidth > 0 && el.offsetWidth <= 25 && el.offsetHeight <= 25) {
                                     var elText = (el.textContent || '').trim();
-                                    badge = el;
-                                    unreadCount = elText ? parseInt(elText) : 1;
-                                    break;
+                                    badge = el; unreadCount = elText ? parseInt(elText) : 1; break;
                                 }
                             }
                         }
                     }
+                    return badge ? { badge: badge, unreadCount: unreadCount } : null;
+                }
 
-                    if (badge) {
-                        var row = badge.closest('[data-testid="cell-frame-container"]') ||
-                                  badge.closest('[role="listitem"]') ||
-                                  item;
+                // === First pass: count ALL unread markers + collect ancestry for first ===
+                var firstUnreadItem = null;
+                var firstUnreadBadge = null;
+                var firstUnreadCount = 0;
 
-                        var nameEl = row.querySelector('span[title]');
-                        var name = nameEl ? (nameEl.getAttribute('title') || '') : '';
+                for (var idx = 0; idx < items.length; idx++) {
+                    var item = items[idx];
+                    var result = findBadge(item);
+                    if (result) {
+                        unreadMarkersFound++;
+                        if (unreadMarkersFound === 1) {
+                            firstUnreadItem = item;
+                            firstUnreadBadge = result.badge;
+                            firstUnreadCount = result.unreadCount;
 
-                        if (!name) {
-                            var walker = badge;
-                            for (var level = 0; level < 10 && walker; level++) {
-                                walker = walker.parentElement;
-                                if (!walker) break;
-                                var titleEl = walker.querySelector('span[title]');
-                                if (titleEl) {
-                                    name = titleEl.getAttribute('title') || '';
-                                    break;
-                                }
-                            }
-                        }
-
-                        if (name) {
-                            if (unreadCount === 0) {
-                                var badgeText = (badge.textContent || '').trim();
-                                unreadCount = parseInt(badgeText) || 1;
-                            }
-
-                            try { row.scrollIntoView({block: 'center'}); } catch(e) {}
-                            await new Promise(function(r) { setTimeout(r, 200); });
-
-                            // Find the truly interactive element inside the row.
-                            // WhatsApp React handlers may be on a descendant with
-                            // role/tabindex, not the outer cell-frame-container.
-                            var clickTarget = row;
-                            var strategy = 'row_click';
-                            var interactive = row.querySelector('[role="button"], [tabindex], a, button');
-                            if (interactive) {
-                                clickTarget = interactive;
-                                strategy = 'interactive_descendant';
-                            }
-
-                            var clickElementTag = clickTarget.tagName;
-                            var clickElementRole = clickTarget.getAttribute('role') || '';
-                            var clickElementTabindex = clickTarget.getAttribute('tabindex') || '';
-
-                            // Dispatch full pointer+mouse event sequence at element center.
-                            // .click() alone does not trigger WhatsApp's React navigation.
-                            var rect = clickTarget.getBoundingClientRect();
-                            var cx = rect.left + rect.width / 2;
-                            var cy = rect.top + rect.height / 2;
-
-                            function fire(type, ctor) {
-                                try {
-                                    var ev = new (ctor || MouseEvent)(type, {
-                                        bubbles: true, cancelable: true, view: window,
-                                        clientX: cx, clientY: cy,
-                                        button: 0, buttons: 1
-                                    });
-                                    clickTarget.dispatchEvent(ev);
-                                } catch(e) {}
-                            }
-
-                            if (window.PointerEvent) {
-                                fire('pointerover', PointerEvent);
-                                fire('pointerenter', PointerEvent);
-                                fire('pointerdown', PointerEvent);
-                            }
-                            fire('mouseover', MouseEvent);
-                            fire('mousedown', MouseEvent);
-                            if (window.PointerEvent) fire('pointerup', PointerEvent);
-                            fire('mouseup', MouseEvent);
-                            try { clickTarget.focus(); } catch(e) {}
-                            fire('click', MouseEvent);
-
-                            // Poll for actual #main navigation — up to 5 seconds.
-                            // Confirm success ONLY when targetChatName == activeChatName.
-                            var activeChatAfter = activeChatBefore;
-                            var navigationConfirmed = false;
-                            for (var poll = 0; poll < 25; poll++) {
-                                await new Promise(function(r) { setTimeout(r, 200); });
-                                activeChatAfter = getActiveChatName();
-                                if (activeChatAfter && activeChatAfter === name) {
-                                    navigationConfirmed = true;
-                                    break;
-                                }
-                            }
-
-                            return JSON.stringify({
-                                clicked: true,
-                                name: name,
-                                clickTargetHtml: (row.outerHTML || '').substring(0, 300),
-                                clickTargetIndex: idx,
-                                unreadCount: unreadCount,
-                                atomicClickTargetName: name,
-                                atomicClickConnected: true,
-                                atomicClickUnreadPresent: true,
-                                activeChatBefore: activeChatBefore,
-                                activeChatAfter: activeChatAfter,
-                                navigationConfirmed: navigationConfirmed,
-                                clickStrategy: strategy,
-                                clickElementTag: clickElementTag,
-                                clickElementRole: clickElementRole,
-                                clickElementTabindex: clickElementTabindex
-                            });
+                            // Collect ancestry diagnostics for first marker
+                            markerHtml = (result.badge.outerHTML || '').substring(0, 300);
+                            var p = result.badge.parentElement;
+                            if (p) { parent1 = (p.outerHTML || '').substring(0, 300); p = p.parentElement; }
+                            if (p) { parent2 = (p.outerHTML || '').substring(0, 300); p = p.parentElement; }
+                            if (p) { parent3 = (p.outerHTML || '').substring(0, 300); }
                         }
                     }
                 }
 
-                return JSON.stringify({ clicked: false, reason: 'no_unread', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '' });
+                if (unreadMarkersFound === 0 || !firstUnreadBadge) {
+                    return JSON.stringify({ clicked: false, reason: 'no_unread', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', chatRowsFound: chatRowsFound, unreadMarkersFound: 0, markerHtml: markerHtml, parent1: parent1, parent2: parent2, parent3: parent3, matchedChatRow: false, matchedChatName: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
+                }
+
+                // === Resolve row + name from the SAME badge (atomic handoff) ===
+                var row = firstUnreadBadge.closest('[data-testid="cell-frame-container"]') ||
+                          firstUnreadBadge.closest('[role="listitem"]') ||
+                          firstUnreadItem;
+
+                var nameEl = row.querySelector('span[title]');
+                var name = nameEl ? (nameEl.getAttribute('title') || '') : '';
+
+                if (!name) {
+                    var walker = firstUnreadBadge;
+                    for (var level = 0; level < 10 && walker; level++) {
+                        walker = walker.parentElement;
+                        if (!walker) break;
+                        var titleEl = walker.querySelector('span[title]');
+                        if (titleEl) { name = titleEl.getAttribute('title') || ''; break; }
+                    }
+                }
+
+                matchedChatRow = !!name;
+                matchedChatName = name || '';
+
+                // === Handoff diagnostics ===
+                // Check if the row and badge survived between detection and click.
+                // (They should — this is the same script execution, no DOM mutation between.)
+                var unreadHandoffName = name || '';
+                var unreadHandoffRowConnected = !!(row && row.isConnected);
+                var unreadHandoffBadgeStillPresent = !!(firstUnreadBadge && firstUnreadBadge.isConnected);
+
+                if (!name || !unreadHandoffRowConnected) {
+                    return JSON.stringify({ clicked: false, reason: 'handoff_failed', name: name || '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: firstUnreadCount, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', chatRowsFound: chatRowsFound, unreadMarkersFound: unreadMarkersFound, markerHtml: markerHtml, parent1: parent1, parent2: parent2, parent3: parent3, matchedChatRow: matchedChatRow, matchedChatName: matchedChatName, unreadHandoffName: unreadHandoffName, unreadHandoffRowConnected: unreadHandoffRowConnected, unreadHandoffBadgeStillPresent: unreadHandoffBadgeStillPresent, clickAttempted: false });
+                }
+
+                if (firstUnreadCount === 0) {
+                    var badgeText = (firstUnreadBadge.textContent || '').trim();
+                    firstUnreadCount = parseInt(badgeText) || 1;
+                }
+
+                // === Click ===
+                try { row.scrollIntoView({block: 'center'}); } catch(e) {}
+                await new Promise(function(r) { setTimeout(r, 200); });
+
+                var clickTarget = row;
+                var strategy = 'row_click';
+                var interactive = row.querySelector('[role="button"], [tabindex], a, button');
+                if (interactive) { clickTarget = interactive; strategy = 'interactive_descendant'; }
+
+                var clickElementTag = clickTarget.tagName;
+                var clickElementRole = clickTarget.getAttribute('role') || '';
+                var clickElementTabindex = clickTarget.getAttribute('tabindex') || '';
+
+                var rect = clickTarget.getBoundingClientRect();
+                var cx = rect.left + rect.width / 2;
+                var cy = rect.top + rect.height / 2;
+
+                function fire(type, ctor) {
+                    try {
+                        var ev = new (ctor || MouseEvent)(type, {
+                            bubbles: true, cancelable: true, view: window,
+                            clientX: cx, clientY: cy, button: 0, buttons: 1
+                        });
+                        clickTarget.dispatchEvent(ev);
+                    } catch(e) {}
+                }
+
+                if (window.PointerEvent) {
+                    fire('pointerover', PointerEvent);
+                    fire('pointerenter', PointerEvent);
+                    fire('pointerdown', PointerEvent);
+                }
+                fire('mouseover', MouseEvent);
+                fire('mousedown', MouseEvent);
+                if (window.PointerEvent) fire('pointerup', PointerEvent);
+                fire('mouseup', MouseEvent);
+                try { clickTarget.focus(); } catch(e) {}
+                fire('click', MouseEvent);
+
+                var clickAttempted = true;
+
+                // === Poll for navigation (up to 5 seconds) ===
+                var activeChatAfter = activeChatBefore;
+                var navigationConfirmed = false;
+                for (var poll = 0; poll < 25; poll++) {
+                    await new Promise(function(r) { setTimeout(r, 200); });
+                    activeChatAfter = getActiveChatName();
+                    if (activeChatAfter && activeChatAfter === name) {
+                        navigationConfirmed = true;
+                        break;
+                    }
+                }
+
+                return JSON.stringify({
+                    clicked: true,
+                    name: name,
+                    clickTargetHtml: (row.outerHTML || '').substring(0, 300),
+                    clickTargetIndex: -1,
+                    unreadCount: firstUnreadCount,
+                    atomicClickTargetName: name,
+                    atomicClickConnected: unreadHandoffRowConnected,
+                    atomicClickUnreadPresent: unreadHandoffBadgeStillPresent,
+                    activeChatBefore: activeChatBefore,
+                    activeChatAfter: activeChatAfter,
+                    navigationConfirmed: navigationConfirmed,
+                    clickStrategy: strategy,
+                    clickElementTag: clickElementTag,
+                    clickElementRole: clickElementRole,
+                    clickElementTabindex: clickElementTabindex,
+                    chatRowsFound: chatRowsFound,
+                    unreadMarkersFound: unreadMarkersFound,
+                    markerHtml: markerHtml,
+                    parent1: parent1,
+                    parent2: parent2,
+                    parent3: parent3,
+                    matchedChatRow: matchedChatRow,
+                    matchedChatName: matchedChatName,
+                    unreadHandoffName: unreadHandoffName,
+                    unreadHandoffRowConnected: unreadHandoffRowConnected,
+                    unreadHandoffBadgeStillPresent: unreadHandoffBadgeStillPresent,
+                    clickAttempted: clickAttempted
+                });
             })();
             """;
 
