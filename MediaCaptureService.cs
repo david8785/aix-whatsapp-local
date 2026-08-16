@@ -146,6 +146,12 @@ public sealed class MediaCaptureService : IDisposable
         _log.Write("UNREAD_MARKERS_FOUND", unreadMarkersFound.ToString());
         _log.Write("UNREAD_CHAT_MATCHES", unreadMarkersFound.ToString());
 
+        if (chatRowsFound == 0)
+        {
+            var reason = node?["reason"]?.GetValue<string>() ?? "null_response";
+            _log.Write("SCAN_NO_ROWS", $"reason={reason}");
+        }
+
         // Marker ancestry diagnostics
         if (unreadMarkersFound > 0)
         {
@@ -188,6 +194,15 @@ public sealed class MediaCaptureService : IDisposable
             _log.Write("NO_MORE_UNREAD", "reason=unread_lost_between_detection_and_click");
             goto scan_complete;
         }
+
+        // === NAVIGATION VERIFICATION (separate sync script) ===
+        // The atomic click script is synchronous (no Promise/await) because WebView2
+        // ExecuteScriptAsync does not reliably resolve async scripts. Navigation
+        // is verified here after a delay, using a separate synchronous script.
+        await Task.Delay(2000);
+        var navNode = await ExecuteScriptJsonAsync(Scripts.VerifyNavigation);
+        activeChatAfter = navNode?["activeChatName"]?.GetValue<string>() ?? "";
+        navigationConfirmed = !string.IsNullOrWhiteSpace(activeChatAfter) && activeChatAfter == name;
 
         // === CHAT SELECTION VERIFICATION ===
         _log.Write("MATCHED_CHAT_NAME", name);
@@ -841,7 +856,7 @@ public sealed class MediaCaptureService : IDisposable
         /// and verifies navigation — all in one DOM snapshot.
         /// </summary>
         public const string FindAndClickUnreadChat = """
-            (async () => {
+            (() => {
                 const pane = document.querySelector('#pane-side');
                 if (!pane) return JSON.stringify({ clicked: false, reason: 'no_pane', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', chatRowsFound: 0, unreadMarkersFound: 0, markerHtml: '', parent1: '', parent2: '', parent3: '', matchedChatRow: false, matchedChatName: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
 
@@ -863,6 +878,7 @@ public sealed class MediaCaptureService : IDisposable
                 var items = pane.querySelectorAll('[data-testid="cell-frame-container"]');
                 if (items.length === 0) items = pane.querySelectorAll('[role="listitem"]');
                 if (items.length === 0) items = pane.querySelectorAll('div[data-id]');
+                if (items.length === 0) items = pane.querySelectorAll('div[role="button"]');
 
                 var chatRowsFound = items.length;
                 var unreadMarkersFound = 0;
@@ -994,7 +1010,6 @@ public sealed class MediaCaptureService : IDisposable
 
                 // === Click ===
                 try { row.scrollIntoView({block: 'center'}); } catch(e) {}
-                await new Promise(function(r) { setTimeout(r, 200); });
 
                 var clickTarget = row;
                 var strategy = 'row_click';
@@ -1033,17 +1048,11 @@ public sealed class MediaCaptureService : IDisposable
 
                 var clickAttempted = true;
 
-                // === Poll for navigation (up to 5 seconds) ===
+                // Navigation verification moved to C# side (VerifyNavigation script + Task.Delay)
+                // to keep this script synchronous — WebView2 ExecuteScriptAsync does not reliably
+                // await async scripts (Promise not resolved → all fields return empty/default).
                 var activeChatAfter = activeChatBefore;
                 var navigationConfirmed = false;
-                for (var poll = 0; poll < 25; poll++) {
-                    await new Promise(function(r) { setTimeout(r, 200); });
-                    activeChatAfter = getActiveChatName();
-                    if (activeChatAfter && activeChatAfter === name) {
-                        navigationConfirmed = true;
-                        break;
-                    }
-                }
 
                 return JSON.stringify({
                     clicked: true,
@@ -1074,6 +1083,24 @@ public sealed class MediaCaptureService : IDisposable
                     unreadHandoffBadgeStillPresent: unreadHandoffBadgeStillPresent,
                     clickAttempted: clickAttempted
                 });
+            })();
+            """;
+
+        public const string VerifyNavigation = """
+            (() => {
+                function getActiveChatName() {
+                    var main = document.querySelector('#main');
+                    if (!main) return '';
+                    var header = main.querySelector('header');
+                    if (!header) return '';
+                    var spans = header.querySelectorAll('span[dir="auto"]');
+                    for (var i = 0; i < spans.length; i++) {
+                        var t = (spans[i].textContent || '').trim();
+                        if (t && t.length > 0 && t.length < 100) return t;
+                    }
+                    return '';
+                }
+                return JSON.stringify({ activeChatName: getActiveChatName() });
             })();
             """;
 
