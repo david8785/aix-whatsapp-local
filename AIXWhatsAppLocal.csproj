@@ -8,8 +8,8 @@
     <ImplicitUsings>enable</ImplicitUsings>
     <AssemblyName>AIXWhatsAppLocal</AssemblyName>
     <RootNamespace>AIXWhatsAppLocal</RootNamespace>
-    <Version>0.1.0</Version>
-    <InformationalVersion>0.1.0</InformationalVersion>
+    <Version>0.2.0</Version>
+    <InformationalVersion>0.2.0</InformationalVersion>
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>true</SelfContained>
     <PublishSingleFile>true</PublishSingleFile>
