@@ -413,6 +413,14 @@ public sealed class MediaCaptureService : IDisposable
                 downloaded++;
                 _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length}");
 
+                // Reject very small files (< 5KB) — these are thumbnails/avatars/placeers,
+                // not real customer photos. A typical WhatsApp photo is > 20KB.
+                if (imageBytes.Length < 5120)
+                {
+                    _log.Write("MEDIA_SKIPPED", $"reason=too_small bytes={imageBytes.Length} threshold=5120 src={srcShort}");
+                    continue;
+                }
+
                 // Compute SHA-256 for dedup
                 var sha256 = ComputeSha256(imageBytes);
 
@@ -1617,7 +1625,17 @@ public sealed class MediaCaptureService : IDisposable
             (() => {
                 const main = document.querySelector('#main');
                 if (!main) return JSON.stringify({ images: [], candidates: [], mainFound: false, totalImgs: 0, filteredSrc: 0, filteredSize: 0, filteredPlaceholder: 0, filteredDup: 0, filteredPreview: 0, messageGroups: 0 });
-                const imgs = main.querySelectorAll('img');
+                // Only select images inside message bubbles — NOT the profile picture
+                // in the conversation header. The header has data-testid="conversation-header"
+                // and contains a 40x40 profile avatar that is NOT customer media.
+                const allImgs = main.querySelectorAll('img');
+                const imgs = Array.from(allImgs).filter(function(img) {
+                    // Exclude images inside any header element (profile picture, call buttons, etc.)
+                    if (img.closest('header')) return false;
+                    // Exclude images inside the conversation-info panel / profile drawer
+                    if (img.closest('[data-testid="conversation-info-header"]')) return false;
+                    return true;
+                });
                 const totalImgs = imgs.length;
                 const seen = new Set();
                 const allEntries = [];
