@@ -161,6 +161,9 @@ public sealed class MediaCaptureService : IDisposable
             _log.Write("ROW_HTML_1", rowHtml1);
             _log.Write("ROW_HTML_2", rowHtml2);
             _log.Write("ROW_HTML_3", rowHtml3);
+            var rowWithNumberHtml = node?["rowWithNumberHtml"]?.GetValue<string>() ?? "";
+            if (!string.IsNullOrEmpty(rowWithNumberHtml))
+                _log.Write("ROW_WITH_NUMBER_HTML", rowWithNumberHtml);
         }
 
         // Marker ancestry diagnostics
@@ -1016,10 +1019,24 @@ public sealed class MediaCaptureService : IDisposable
                 var matchedChatRow = false;
                 var matchedChatName = '';
 
-                // Capture first 3 row HTMLs for badge structure diagnostics
-                var rowHtml1 = items.length > 0 ? (items[0].outerHTML || '').substring(0, 800) : '';
-                var rowHtml2 = items.length > 1 ? (items[1].outerHTML || '').substring(0, 800) : '';
-                var rowHtml3 = items.length > 2 ? (items[2].outerHTML || '').substring(0, 800) : '';
+                // Capture first 3 row HTMLs for badge structure diagnostics (2000 chars to see full row)
+                var rowHtml1 = items.length > 0 ? (items[0].outerHTML || '').substring(0, 2000) : '';
+                var rowHtml2 = items.length > 1 ? (items[1].outerHTML || '').substring(0, 2000) : '';
+                var rowHtml3 = items.length > 2 ? (items[2].outerHTML || '').substring(0, 2000) : '';
+
+                // Also find the first row that contains a number (potential unread badge)
+                var rowWithNumberHtml = '';
+                for (var rn = 0; rn < items.length; rn++) {
+                    var spans = items[rn].querySelectorAll('span, div');
+                    for (var sn = 0; sn < spans.length; sn++) {
+                        var t = (spans[sn].textContent || '').trim();
+                        if (/^\d+$/.test(t) && t.length <= 3 && spans[sn].offsetWidth > 0 && spans[sn].offsetWidth <= 30) {
+                            rowWithNumberHtml = (items[rn].outerHTML || '').substring(0, 2000);
+                            break;
+                        }
+                    }
+                    if (rowWithNumberHtml) break;
+                }
 
                 // === Badge detection helper ===
                 function findBadge(item) {
@@ -1071,6 +1088,29 @@ public sealed class MediaCaptureService : IDisposable
                             }
                         }
                     }
+                    // Method 6: Broader green match — any green-ish background (hue ~120-180)
+                    // with a number. WhatsApp's green is #25D366 (rgb(37,211,102)) but the
+                    // exact shade may vary. Match any element where G > R and G > B and
+                    // the element is small (badge-sized) with numeric text.
+                    if (!badge) {
+                        var allEls2 = item.querySelectorAll('span, div');
+                        for (var g = 0; g < allEls2.length; g++) {
+                            var gel = allEls2[g];
+                            var gt = (gel.textContent || '').trim();
+                            if (!/^\d+$/.test(gt) || gt.length > 3) continue;
+                            if (gel.offsetWidth <= 0 || gel.offsetWidth > 35) continue;
+                            var gst = window.getComputedStyle(gel);
+                            var bg = gst.backgroundColor;
+                            // Parse rgb(r, g, b) or rgba(r, g, b, a)
+                            var m = bg.match(/rgba?\((\d+),\s*(\d+),\s*(\d+)/);
+                            if (!m) continue;
+                            var r = parseInt(m[1]), gg = parseInt(m[2]), b = parseInt(m[3]);
+                            // Green-ish: G significantly > R and G significantly > B
+                            if (gg > r + 30 && gg > b + 30 && gg > 100) {
+                                badge = gel; unreadCount = parseInt(gt); break;
+                            }
+                        }
+                    }
                     return badge ? { badge: badge, unreadCount: unreadCount } : null;
                 }
 
@@ -1100,7 +1140,7 @@ public sealed class MediaCaptureService : IDisposable
                 }
 
                 if (unreadMarkersFound === 0 || !firstUnreadBadge) {
-                    return JSON.stringify({ clicked: false, reason: 'no_unread', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', chatRowsFound: chatRowsFound, unreadMarkersFound: 0, markerHtml: markerHtml, parent1: parent1, parent2: parent2, parent3: parent3, matchedChatRow: false, matchedChatName: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false, rowHtml1: rowHtml1, rowHtml2: rowHtml2, rowHtml3: rowHtml3 });
+                    return JSON.stringify({ clicked: false, reason: 'no_unread', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', chatRowsFound: chatRowsFound, unreadMarkersFound: 0, markerHtml: markerHtml, parent1: parent1, parent2: parent2, parent3: parent3, matchedChatRow: false, matchedChatName: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false, rowHtml1: rowHtml1, rowHtml2: rowHtml2, rowHtml3: rowHtml3, rowWithNumberHtml: rowWithNumberHtml });
                 }
 
                 // === Resolve row + name from the SAME badge (atomic handoff) ===
