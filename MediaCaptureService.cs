@@ -1466,6 +1466,7 @@ public sealed class MediaCaptureService : IDisposable
                 var phoneAttrCandidates = [];
                 var phoneTextCandidates = [];
                 var phoneJidCandidates = [];
+                var matchedJid = '';
                 var phone = '';
                 var phoneSource = '';
                 var openedContactPanel = false;
@@ -1473,13 +1474,11 @@ public sealed class MediaCaptureService : IDisposable
 
                 function extractPhone(s) {
                     if (!s) return '';
-                    var patterns = [/\+?972[\d\s\-()]{7,15}/, /0?5[\d][\d\s\-()]{6,12}/, /\+[\d][\d\s\-()]{6,14}/];
-                    for (var p = 0; p < patterns.length; p++) {
-                        var m = s.match(patterns[p]);
-                        if (m) {
-                            var digits = m[0].replace(/\D/g, '');
-                            if (digits.length >= 7) return digits;
-                        }
+                    // Broad: any digit sequence 7-15 digits long (international + local)
+                    var m = s.match(/\+?[\d][\d\s\-()]{6,14}/);
+                    if (m) {
+                        var digits = m[0].replace(/\D/g, '');
+                        if (digits.length >= 7 && digits.length <= 15) return digits;
                     }
                     return '';
                 }
@@ -1489,13 +1488,11 @@ public sealed class MediaCaptureService : IDisposable
                     var atIdx = jid.indexOf('@');
                     if (atIdx <= 0) return '';
                     var local = jid.substring(0, atIdx);
-                    var domain = jid.substring(atIdx + 1);
-                    if (domain === 'c.us' || domain === 's.whatsapp.net') {
-                        if (local.indexOf('true_') === 0) local = local.substring(5);
-                        var digits = local.replace(/\D/g, '');
-                        return digits.length >= 7 ? digits : '';
-                    }
-                    return '';
+                    // Accept any domain — WhatsApp uses c.us, s.whatsapp.net, and others
+                    if (local.indexOf('true_') === 0) local = local.substring(5);
+                    if (local.indexOf('gid_') === 0) return ''; // group ID, not a phone
+                    var digits = local.replace(/\D/g, '');
+                    return digits.length >= 7 ? digits : '';
                 }
 
                 var main = document.querySelector('#main');
@@ -1510,9 +1507,38 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
-                // 1. Scan #pane-side (chat list) for data-id — chat JIDs (phone@c.us)
+                // 1. MATCHED ROW: Find the chat list row in #pane-side whose span[title]
+                //    matches the active chat name. Extract the JID from THAT row only.
+                //    This is the key fix — previously we took the first JID from ALL rows,
+                //    which was often a different chat.
                 var pane = document.querySelector('#pane-side');
-                if (pane) {
+                if (pane && activeName) {
+                    var rows = pane.querySelectorAll('[data-testid="cell-frame-container"], [role="listitem"], div[data-id]');
+                    for (var r = 0; r < rows.length; r++) {
+                        var row = rows[r];
+                        var titleEl = row.querySelector('span[title]');
+                        var rowName = titleEl ? (titleEl.getAttribute('title') || '') : '';
+                        if (rowName && rowName === activeName) {
+                            // Found the matching row — extract JID from its data-id
+                            var rowJid = row.getAttribute('data-id') || '';
+                            if (!rowJid) {
+                                // data-id might be on a child or parent
+                                var childWithId = row.querySelector('[data-id]');
+                                if (childWithId) rowJid = childWithId.getAttribute('data-id') || '';
+                            }
+                            if (rowJid) {
+                                phoneAttrCandidates.push('matched_row:' + rowJid);
+                                matchedJid = rowJid;
+                                var mp = extractPhoneFromJid(rowJid);
+                                if (mp) { phone = mp; phoneSource = 'matched_row_jid'; }
+                            }
+                            break;
+                        }
+                    }
+                }
+
+                // 2. Fallback: scan ALL #pane-side data-ids (if matched row had no JID)
+                if (!phone && pane) {
                     var allDataId = pane.querySelectorAll('[data-id]');
                     for (var i = 0; i < allDataId.length && i < 50; i++) {
                         var did = allDataId[i].getAttribute('data-id') || '';
@@ -1523,8 +1549,8 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
-                // 2. Scan #main for data-id, data-lid, data-user, data-jid
-                if (main) {
+                // 3. Scan #main for data-id, data-lid, data-user, data-jid
+                if (!phone && main) {
                     var attrs = ['data-id', 'data-lid', 'data-user', 'data-jid'];
                     for (var a = 0; a < attrs.length; a++) {
                         var els = main.querySelectorAll('[' + attrs[a] + ']');
@@ -1538,8 +1564,8 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
-                // 3. Scan visible text in #main for phone patterns (+972, 05x)
-                if (main) {
+                // 4. Scan visible text in #main for phone patterns
+                if (!phone && main) {
                     var allText = main.innerText || '';
                     var lines = allText.split('\n');
                     for (var t = 0; t < lines.length && t < 100; t++) {
@@ -1550,8 +1576,8 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
-                // 4. Scan aria-label and title in #main for phone patterns
-                if (main) {
+                // 5. Scan aria-label and title in #main for phone patterns
+                if (!phone && main) {
                     var labeled = main.querySelectorAll('[aria-label], [title]');
                     for (var l = 0; l < labeled.length && l < 50; l++) {
                         var al = labeled[l].getAttribute('aria-label') || '';
@@ -1561,20 +1587,22 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
-                // 5. Scan tel: links
-                var telLinks = document.querySelectorAll('a[href^="tel:"]');
-                for (var h = 0; h < telLinks.length; h++) {
-                    var hp = extractPhone(telLinks[h].getAttribute('href') || '');
-                    if (hp) phoneTextCandidates.push('tel:' + hp);
+                // 6. Scan tel: links
+                if (!phone) {
+                    var telLinks = document.querySelectorAll('a[href^="tel:"]');
+                    for (var h = 0; h < telLinks.length; h++) {
+                        var hp = extractPhone(telLinks[h].getAttribute('href') || '');
+                        if (hp) phoneTextCandidates.push('tel:' + hp);
+                    }
                 }
 
-                // 6. Last resort: open contact-info panel, read phone, close it
-                if (phoneJidCandidates.length === 0 && phoneTextCandidates.length === 0 && header) {
+                // 7. Last resort: open contact-info panel, read phone, close it
+                if (!phone && header) {
                     try {
-                        var contactBtn = header.querySelector('div[role="button"]') || header;
+                        var contactBtn = header.querySelector('div[role="button"], [data-testid="conversation-info-button"]') || header;
                         contactBtn.click();
                         openedContactPanel = true;
-                        await new Promise(function(r) { setTimeout(r, 2000); });
+                        await new Promise(function(r) { setTimeout(r, 2500); });
 
                         // Scan the whole document for phone text (panel is a new overlay)
                         var allSpans = document.querySelectorAll('span[dir="auto"], span[title], [aria-label]');
@@ -1598,11 +1626,12 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
-                // Pick best phone — prefer JID, then text
-                if (phoneJidCandidates.length > 0) {
+                // Pick best phone — prefer matched row JID, then any JID, then text
+                if (!phone && phoneJidCandidates.length > 0) {
                     phone = phoneJidCandidates[0];
                     phoneSource = 'jid';
-                } else if (phoneTextCandidates.length > 0) {
+                }
+                if (!phone && phoneTextCandidates.length > 0) {
                     var last = phoneTextCandidates[phoneTextCandidates.length - 1];
                     var arrowIdx = last.lastIndexOf('->');
                     phone = arrowIdx >= 0 ? last.substring(arrowIdx + 1).trim() : extractPhone(last);
@@ -1615,6 +1644,7 @@ public sealed class MediaCaptureService : IDisposable
                     phoneAttrCandidates: phoneAttrCandidates,
                     phoneTextCandidates: phoneTextCandidates,
                     phoneJidCandidates: phoneJidCandidates,
+                    matchedJid: matchedJid,
                     openedContactPanel: openedContactPanel,
                     activeName: activeName
                 });
