@@ -519,10 +519,21 @@ public sealed class MediaCaptureService : IDisposable
                 return bytes;
             }
 
-            // Source type 2 & 3: blob: or http(s): — use CDP Network.getResponseBody
+            // Source type 2 & 3: blob: or http(s):
+            // BLOB URLs are client-side objects with NO network response — CDP
+            // Network.getResponseBody cannot retrieve them. Use JavaScript fetch()
+            // instead, which resolves blob: URLs from in-memory data.
+            // HTTP URLs: try CDP first (captures original network response), then
+            // fall back to JavaScript fetch() if no matching response was captured.
             _log.Write("MEDIA_SOURCE_TYPE", url.StartsWith("blob:") ? "BLOB_URL" : "HTTP_URL");
 
-            // Brief delay to ensure network response is fully captured
+            // For blob: URLs — use JavaScript fetch directly (CDP can't handle them)
+            if (url.StartsWith("blob:"))
+            {
+                return await DownloadViaJsFetchAsync(url);
+            }
+
+            // For http(s): URLs — try CDP first, then JS fetch fallback
             await Task.Delay(500);
 
             NetworkResponseInfo? info;
@@ -537,46 +548,143 @@ public sealed class MediaCaptureService : IDisposable
                 }
             }
 
-            if (info == null)
+            if (info != null)
             {
-                var urlShort = url.Length > 80 ? url[..80] : url;
-                _log.Write("MEDIA_FAILURE", $"stage=NETWORK_MATCH reason=no_matching_response url={urlShort}");
-                return null;
-            }
+                _log.Write("NETWORK_REQUEST_MATCHED", $"requestId={info.RequestId} url={(url.Length > 80 ? url[..80] : url)}");
 
-            _log.Write("NETWORK_REQUEST_MATCHED", $"requestId={info.RequestId} url={(url.Length > 80 ? url[..80] : url)}");
+                try
+                {
+                    var paramsJson = JsonSerializer.Serialize(new { requestId = info.RequestId });
+                    var resultJson = await _webView.CallDevToolsProtocolMethodAsync("Network.getResponseBody", paramsJson);
 
-            var paramsJson = JsonSerializer.Serialize(new { requestId = info.RequestId });
-            var resultJson = await _webView.CallDevToolsProtocolMethodAsync("Network.getResponseBody", paramsJson);
+                    using var resultDoc = JsonDocument.Parse(resultJson);
+                    var body = resultDoc.RootElement.GetProperty("body").GetString() ?? "";
+                    var base64Encoded = resultDoc.RootElement.TryGetProperty("base64Encoded", out var b64) && b64.GetBoolean();
 
-            using var resultDoc = JsonDocument.Parse(resultJson);
-            var body = resultDoc.RootElement.GetProperty("body").GetString() ?? "";
-            var base64Encoded = resultDoc.RootElement.TryGetProperty("base64Encoded", out var b64) && b64.GetBoolean();
+                    if (string.IsNullOrEmpty(body))
+                    {
+                        _log.Write("MEDIA_FAILURE", $"stage=NETWORK_MATCH reason=empty_body url={(url.Length > 80 ? url[..80] : url)}");
+                    }
+                    else
+                    {
+                        byte[] imageBytes;
+                        if (base64Encoded)
+                        {
+                            imageBytes = Convert.FromBase64String(body);
+                        }
+                        else
+                        {
+                            imageBytes = System.Text.Encoding.UTF8.GetBytes(body);
+                        }
 
-            if (string.IsNullOrEmpty(body))
-            {
-                _log.Write("MEDIA_FAILURE", $"stage=NETWORK_MATCH reason=empty_body url={(url.Length > 80 ? url[..80] : url)}");
-                return null;
-            }
-
-            byte[] imageBytes;
-            if (base64Encoded)
-            {
-                imageBytes = Convert.FromBase64String(body);
+                        _log.Write("RESPONSE_BODY_RECEIVED", $"bytes={imageBytes.Length} base64Encoded={base64Encoded} source=CDP");
+                        _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length}");
+                        return imageBytes;
+                    }
+                }
+                catch (Exception cdpEx)
+                {
+                    _log.Write("MEDIA_FAILURE", $"stage=CDP_GETBODY reason={cdpEx.Message} url={(url.Length > 80 ? url[..80] : url)}");
+                }
             }
             else
             {
-                imageBytes = System.Text.Encoding.UTF8.GetBytes(body);
+                var urlShort = url.Length > 80 ? url[..80] : url;
+                _log.Write("MEDIA_FAILURE", $"stage=NETWORK_MATCH reason=no_matching_response url={urlShort} — trying JS fetch fallback");
             }
 
-            _log.Write("RESPONSE_BODY_RECEIVED", $"bytes={imageBytes.Length} base64Encoded={base64Encoded}");
-            _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length}");
-            return imageBytes;
+            // CDP failed or no match — fall back to JavaScript fetch
+            return await DownloadViaJsFetchAsync(url);
         }
         catch (Exception ex)
         {
             _log.Write("MEDIA_DOWNLOAD_FAILED", $"error={ex.Message}");
             LastErrorChanged?.Invoke($"Download exception: {ex.Message}");
+            return null;
+        }
+    }
+
+    /// <summary>
+    /// Download image bytes via JavaScript fetch() — works for blob: and http(s): URLs.
+    /// Uses an async IIFE that fetches the URL, reads it as a data URL via FileReader,
+    /// and returns base64. WebView2 resolves async scripts (GetContactPhone uses the
+    /// same pattern successfully).
+    /// </summary>
+    private async Task<byte[]?> DownloadViaJsFetchAsync(string url)
+    {
+        try
+        {
+            var urlJson = JsonSerializer.Serialize(url);
+            var script = $$"""
+                (async () => {
+                    try {
+                        const response = await fetch({{urlJson}});
+                        if (!response.ok) return JSON.stringify({ error: 'HTTP ' + response.status });
+                        const blob = await response.blob();
+                        if (blob.size === 0) return JSON.stringify({ error: 'empty_blob' });
+                        return await new Promise(resolve => {
+                            const reader = new FileReader();
+                            reader.onloadend = () => {
+                                const base64 = reader.result.split(',')[1];
+                                resolve(JSON.stringify({ base64: base64, size: blob.size, type: blob.type }));
+                            };
+                            reader.onerror = () => resolve(JSON.stringify({ error: 'FileReader error' }));
+                            reader.readAsDataURL(blob);
+                        });
+                    } catch (e) {
+                        return JSON.stringify({ error: e.message });
+                    }
+                })();
+                """;
+
+            var raw = await _webView.ExecuteScriptAsync(script);
+            if (string.IsNullOrEmpty(raw))
+            {
+                _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=empty_response url={(url.Length > 80 ? url[..80] : url)}");
+                return null;
+            }
+
+            var innerJson = JsonSerializer.Deserialize<string>(raw) ?? "";
+            if (string.IsNullOrEmpty(innerJson))
+            {
+                _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=empty_inner_json url={(url.Length > 80 ? url[..80] : url)}");
+                return null;
+            }
+
+            using var doc = JsonDocument.Parse(innerJson);
+            var root = doc.RootElement;
+
+            if (root.TryGetProperty("error", out var errProp))
+            {
+                var errMsg = errProp.GetString() ?? "unknown";
+                _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason={errMsg} url={(url.Length > 80 ? url[..80] : url)}");
+                return null;
+            }
+
+            if (!root.TryGetProperty("base64", out var b64Prop))
+            {
+                _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=no_base64_field url={(url.Length > 80 ? url[..80] : url)}");
+                return null;
+            }
+
+            var base64Str = b64Prop.GetString() ?? "";
+            if (string.IsNullOrEmpty(base64Str))
+            {
+                _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=empty_base64 url={(url.Length > 80 ? url[..80] : url)}");
+                return null;
+            }
+
+            var imageBytes = Convert.FromBase64String(base64Str);
+            var blobSize = root.TryGetProperty("size", out var szProp) ? szProp.GetInt64() : imageBytes.Length;
+            var blobType = root.TryGetProperty("type", out var tpProp) ? tpProp.GetString() ?? "" : "";
+
+            _log.Write("RESPONSE_BODY_RECEIVED", $"bytes={imageBytes.Length} blobSize={blobSize} type={blobType} source=JS_FETCH");
+            _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length}");
+            return imageBytes;
+        }
+        catch (Exception ex)
+        {
+            _log.Write("MEDIA_DOWNLOAD_FAILED", $"error={ex.Message} stage=JS_FETCH url={(url.Length > 80 ? url[..80] : url)}");
             return null;
         }
     }
