@@ -130,20 +130,31 @@ public sealed class MediaCaptureService : IDisposable
         var storeSource = node?["source"]?.GetValue<string>() ?? "";
         var storeClicked = node?["clicked"]?.GetValue<bool>() ?? false;
         var storeChatCount = node?["storeChatCount"]?.GetValue<int>() ?? 0;
+        var storeUnreadTotal = node?["storeUnreadTotal"]?.GetValue<int>() ?? 0;
 
         _log.Write("UNREAD_DETECTION_SOURCE", storeSource);
         _log.Write("UNREAD_DETECTION_CLICKED", storeClicked.ToString().ToLowerInvariant());
         if (storeChatCount > 0)
             _log.Write("STORE_CHAT_COUNT", storeChatCount.ToString());
 
+        // Log each unread chat found in the store
+        var storeUnreadChats = node?["storeUnreadChats"]?.AsArray();
+        if (storeUnreadChats != null)
+        {
+            foreach (var uc in storeUnreadChats)
+            {
+                var ucId = uc?["id"]?.GetValue<string>() ?? "";
+                var ucName = uc?["name"]?.GetValue<string>() ?? "";
+                var ucCount = uc?["unreadCount"]?.GetValue<int>() ?? 0;
+                _log.Write("STORE_UNREAD_CHAT", $"id={ucId} name={ucName} unreadCount={ucCount}");
+            }
+        }
+        _log.Write("STORE_UNREAD_TOTAL", storeUnreadTotal.ToString());
+
         if (!storeClicked)
         {
             _log.Write("UNREAD_DETECTION_FALLBACK", $"{storeSource} -> dom");
             node = await ExecuteScriptJsonAsync(Scripts.FindAndClickUnreadChat);
-        }
-        else
-        {
-            _log.Write("UNREAD_DETECTION_SUCCESS", $"source=store name={node?["name"]?.GetValue<string>()} unread={node?["unreadCount"]?.GetValue<int>()}");
         }
         var chatRowsFound = node?["chatRowsFound"]?.GetValue<int>() ?? 0;
         var unreadMarkersFound = node?["unreadMarkersFound"]?.GetValue<int>() ?? 0;
@@ -295,6 +306,10 @@ public sealed class MediaCaptureService : IDisposable
         _log.Write("ACTIVE_CHAT_BEFORE", activeChatBefore);
         _log.Write("ACTIVE_CHAT_AFTER", activeChatAfter);
         _log.Write("NAVIGATION_CONFIRMED", navigationConfirmed.ToString().ToLowerInvariant());
+        if (navigationConfirmed && storeClicked)
+        {
+            _log.Write("UNREAD_DETECTION_SUCCESS", $"source=store name={name} unread={chatUnreadCount}");
+        }
         _log.Write("CHAT_CLICKED", $"name={name}");
         CurrentChatChanged?.Invoke(name);
         UpdateStatus($"Opening: {name}");
@@ -2140,15 +2155,15 @@ public sealed class MediaCaptureService : IDisposable
         /// Returns the same fields as FindAndClickUnreadChat for seamless integration.
         /// </summary>
         public const string FindAndClickUnreadViaStore = """
-            (() => {
+            (async () => {
                 try {
                     if (typeof window.require !== 'function') {
-                        return JSON.stringify({ clicked: false, reason: 'no_window_require', source: 'store', chatRowsFound: 0, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
+                        return JSON.stringify({ clicked: false, reason: 'no_window_require', source: 'store', storeUnreadTotal: 0, storeUnreadChats: [], storeChatCount: 0, chatRowsFound: 0, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
                     }
 
                     var chatCollection = window.require('WAWebCollections');
                     if (!chatCollection || !chatCollection.Chat) {
-                        return JSON.stringify({ clicked: false, reason: 'no_chat_collection', source: 'store', chatRowsFound: 0, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
+                        return JSON.stringify({ clicked: false, reason: 'no_chat_collection', source: 'store', storeUnreadTotal: 0, storeUnreadChats: [], storeChatCount: 0, chatRowsFound: 0, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
                     }
 
                     var chats = chatCollection.Chat.getModelsArray();
@@ -2156,11 +2171,12 @@ public sealed class MediaCaptureService : IDisposable
                     for (var i = 0; i < chats.length; i++) {
                         try {
                             var chat = chats[i];
-                            if (chat.unreadCount > 0 && !chat.archive) {
+                            var uc = chat.unreadCount || 0;
+                            if (uc > 0) {
                                 unreadChats.push({
                                     id: (chat.id && chat.id._serialized) ? chat.id._serialized : '',
                                     name: chat.formattedTitle || chat.name || '',
-                                    unreadCount: chat.unreadCount
+                                    unreadCount: uc
                                 });
                             }
                         } catch (e) {}
@@ -2171,7 +2187,7 @@ public sealed class MediaCaptureService : IDisposable
                     var chatRowsFound = domRows.length;
 
                     if (unreadChats.length === 0) {
-                        return JSON.stringify({ clicked: false, reason: 'no_unread_in_store', source: 'store', chatRowsFound: chatRowsFound, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false, storeChatCount: chats.length });
+                        return JSON.stringify({ clicked: false, reason: 'no_unread_in_store', source: 'store', storeUnreadTotal: 0, storeUnreadChats: [], storeChatCount: chats.length, chatRowsFound: chatRowsFound, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
                     }
 
                     var targetName = unreadChats[0].name;
@@ -2192,7 +2208,7 @@ public sealed class MediaCaptureService : IDisposable
                     }
 
                     if (!clickedRow) {
-                        return JSON.stringify({ clicked: false, reason: 'row_not_found', source: 'store', chatRowsFound: chatRowsFound, unreadMarkersFound: unreadChats.length, name: targetName, clickTargetHtml: '', clickTargetIndex: -1, unreadCount: unreadChats[0].unreadCount, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: targetName, unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false, storeChatCount: chats.length, unreadChats: unreadChats });
+                        return JSON.stringify({ clicked: false, reason: 'row_not_found', source: 'store', storeUnreadTotal: unreadChats.length, storeUnreadChats: unreadChats, storeChatCount: chats.length, chatRowsFound: chatRowsFound, unreadMarkersFound: unreadChats.length, name: targetName, clickTargetHtml: '', clickTargetIndex: -1, unreadCount: unreadChats[0].unreadCount, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: targetName, unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
                     }
 
                     function getActiveChatName() {
@@ -2245,20 +2261,33 @@ public sealed class MediaCaptureService : IDisposable
                     try { clickTarget.focus(); } catch(e) {}
                     fire('click', MouseEvent);
 
+                    await new Promise(function(r) { setTimeout(r, 1500); });
+
+                    var activeChatAfter = getActiveChatName();
+                    var navigationConfirmed = false;
+                    if (activeChatAfter && targetName) {
+                        if (activeChatAfter === targetName ||
+                            (targetName.length > 2 && activeChatAfter.indexOf(targetName) >= 0) ||
+                            (activeChatAfter.length > 2 && targetName.indexOf(activeChatAfter) >= 0)) {
+                            navigationConfirmed = true;
+                        }
+                    }
+
                     return JSON.stringify({
                         clicked: true, source: 'store', name: targetName,
+                        storeUnreadTotal: unreadChats.length, storeUnreadChats: unreadChats, storeChatCount: chats.length,
                         chatRowsFound: chatRowsFound, unreadMarkersFound: unreadChats.length,
                         clickTargetHtml: (clickedRow.outerHTML || '').substring(0, 300),
                         clickTargetIndex: clickedIndex, unreadCount: unreadChats[0].unreadCount,
                         atomicClickTargetName: targetName, atomicClickConnected: true, atomicClickUnreadPresent: true,
-                        activeChatBefore: activeChatBefore, activeChatAfter: activeChatBefore,
-                        navigationConfirmed: false, clickStrategy: strategy,
+                        activeChatBefore: activeChatBefore, activeChatAfter: activeChatAfter,
+                        navigationConfirmed: navigationConfirmed, clickStrategy: strategy,
                         clickElementTag: clickElementTag, clickElementRole: clickElementRole, clickElementTabindex: clickElementTabindex,
                         unreadHandoffName: targetName, unreadHandoffRowConnected: true, unreadHandoffBadgeStillPresent: true,
-                        clickAttempted: true, storeChatCount: chats.length, unreadChats: unreadChats
+                        clickAttempted: true
                     });
                 } catch (e) {
-                    return JSON.stringify({ clicked: false, reason: 'exception: ' + e.message, source: 'store', chatRowsFound: 0, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
+                    return JSON.stringify({ clicked: false, reason: 'exception: ' + e.message, source: 'store', storeUnreadTotal: 0, storeUnreadChats: [], storeChatCount: 0, chatRowsFound: 0, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
                 }
             })();
             """;
