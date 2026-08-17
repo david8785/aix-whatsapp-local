@@ -535,7 +535,7 @@ public sealed class MediaCaptureService : IDisposable
             var duplicates = 0;
             var failed = 0;
 
-            var chatId = $"{customerName}|{phone}";
+            var dbChatId = $"{customerName}|{phone}";
             // Compute folder base fresh per scan using DateTime.Now — scopes to current hour.
             // Previously used DB base which returned OLD hour folders, preventing new hourly
             // folders from being created. FindExistingFolder still reuses same-hour folders
@@ -643,7 +643,7 @@ public sealed class MediaCaptureService : IDisposable
 
                     // Insert into database for dedup
                     var mediaId = Guid.NewGuid().ToString("N");
-                    _db.InsertMedia(mediaId, chatId, customerName, phone,
+                    _db.InsertMedia(mediaId, dbChatId, customerName, phone,
                         DateTime.Now.ToString("o"), sha256, localPath, orderFolderBase);
 
                     saved++;
