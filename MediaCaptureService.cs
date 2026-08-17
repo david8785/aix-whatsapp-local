@@ -341,6 +341,10 @@ public sealed class MediaCaptureService : IDisposable
         }
 
         // === CHAT SELECTION VERIFICATION ===
+        _log.Write("TARGET_CHAT_ID", chatId);
+        _log.Write("TARGET_CHAT_NAME", name);
+        _log.Write("RESOLVED_ROW_NAME", node?["resolvedRowName"]?.GetValue<string>() ?? "");
+        _log.Write("ROW_CLICKED", (node?["rowClicked"]?.GetValue<bool>() ?? false).ToString().ToLowerInvariant());
         _log.Write("MATCHED_CHAT_NAME", name);
         _log.Write("ATOMIC_CLICK_TARGET_NAME", atomicClickTargetName);
         _log.Write("ATOMIC_CLICK_CONNECTED", atomicClickConnected.ToString().ToLowerInvariant());
@@ -2348,20 +2352,45 @@ public sealed class MediaCaptureService : IDisposable
                         return JSON.stringify({ clicked: false, reason: noUnreadReason, source: 'store', storeUnreadTotal: 0, allUnreadTotal: allUnreadChats.length, storeUnreadChats: [], storeChatCount: chats.length, chatRowsFound: chatRowsFound, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
                     }
 
+                    var targetChatId = unreadChats[0].id || '';
                     var targetName = unreadChats[0].name;
                     var clickedRow = null;
                     var clickedIndex = -1;
+                    var resolvedRowName = '';
 
-                    for (var r = 0; r < domRows.length; r++) {
-                        var titleEl = domRows[r].querySelector('span[title]');
-                        var rowName = titleEl ? (titleEl.getAttribute('title') || '') : '';
-                        if (rowName && targetName &&
-                            (rowName === targetName ||
-                             (targetName.length > 2 && rowName.indexOf(targetName) >= 0) ||
-                             (rowName.length > 2 && targetName.indexOf(rowName) >= 0))) {
-                            clickedRow = domRows[r];
-                            clickedIndex = r;
-                            break;
+                    // 1. Match by chat ID (JID) — most reliable.
+                    //    DOM rows carry data-id attributes containing the JID.
+                    if (targetChatId) {
+                        for (var r = 0; r < domRows.length; r++) {
+                            var rowJid = domRows[r].getAttribute('data-id') || '';
+                            if (!rowJid) {
+                                var childWithId = domRows[r].querySelector('[data-id]');
+                                if (childWithId) rowJid = childWithId.getAttribute('data-id') || '';
+                            }
+                            if (rowJid && rowJid === targetChatId) {
+                                clickedRow = domRows[r];
+                                clickedIndex = r;
+                                var tEl = domRows[r].querySelector('span[title]');
+                                resolvedRowName = tEl ? (tEl.getAttribute('title') || '') : '';
+                                break;
+                            }
+                        }
+                    }
+
+                    // 2. Fallback: match by name (fuzzy)
+                    if (!clickedRow) {
+                        for (var r2 = 0; r2 < domRows.length; r2++) {
+                            var titleEl = domRows[r2].querySelector('span[title]');
+                            var rowName = titleEl ? (titleEl.getAttribute('title') || '') : '';
+                            if (rowName && targetName &&
+                                (rowName === targetName ||
+                                 (targetName.length > 2 && rowName.indexOf(targetName) >= 0) ||
+                                 (rowName.length > 2 && targetName.indexOf(rowName) >= 0))) {
+                                clickedRow = domRows[r2];
+                                clickedIndex = r2;
+                                resolvedRowName = rowName;
+                                break;
+                            }
                         }
                     }
 
@@ -2409,9 +2438,9 @@ public sealed class MediaCaptureService : IDisposable
 
                     try { clickedRow.scrollIntoView({block: 'center'}); } catch(e) {}
 
-                    var interactive = clickedRow.querySelector('[role="button"], [tabindex], a, button');
-                    var clickTarget = interactive || clickedRow;
-                    var strategy = interactive ? 'interactive_descendant' : 'row_click';
+                    // ALWAYS click the row container itself — never a descendant.
+                    var clickTarget = clickedRow;
+                    var strategy = 'row_click';
 
                     var clickElementTag = clickTarget.tagName;
                     var clickElementRole = clickTarget.getAttribute('role') || '';
@@ -2455,6 +2484,7 @@ public sealed class MediaCaptureService : IDisposable
                         clickTargetHtml: (clickedRow.outerHTML || '').substring(0, 300),
                         clickTargetIndex: clickedIndex, unreadCount: unreadChats[0].unreadCount,
                         atomicClickTargetName: targetName, atomicClickConnected: true, atomicClickUnreadPresent: true,
+                        targetChatId: targetChatId, resolvedRowName: resolvedRowName, rowClicked: true,
                         activeChatBefore: activeChatBefore, activeChatAfter: activeChatBefore,
                         navigationConfirmed: false, clickStrategy: strategy,
                         clickElementTag: clickElementTag, clickElementRole: clickElementRole, clickElementTabindex: clickElementTabindex,
