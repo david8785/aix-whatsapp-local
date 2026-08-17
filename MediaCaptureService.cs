@@ -855,9 +855,7 @@ public sealed class MediaCaptureService : IDisposable
         try
         {
             var urlJson = JsonSerializer.Serialize(url);
-            // Use arrayBuffer + btoa instead of FileReader — more reliable for blob: URLs.
-            // FileReader.readAsDataURL can silently fail to fire onloadend for blob: in WebView2.
-            // arrayBuffer + chunked btoa always produces a valid base64 string.
+            // Use arrayBuffer + btoa — more reliable than FileReader for blob: URLs.
             var script = $$"""
                 (async () => {
                     try {
@@ -866,7 +864,6 @@ public sealed class MediaCaptureService : IDisposable
                         const buf = await response.arrayBuffer();
                         if (buf.byteLength === 0) return JSON.stringify({ error: 'empty_buffer' });
                         const bytes = new Uint8Array(buf);
-                        // Chunked base64 encoding — avoids call stack limit on large images
                         let binary = '';
                         const chunkSize = 8192;
                         for (let i = 0; i < bytes.length; i += chunkSize) {
@@ -882,38 +879,31 @@ public sealed class MediaCaptureService : IDisposable
                 })();
                 """;
 
-            var raw = await _webView.ExecuteScriptAsync(script);
-            if (string.IsNullOrEmpty(raw))
+            // === FIX: ExecuteScriptAsync does NOT await Promises — returns {} for async scripts.
+            // Use CDP Runtime.evaluate with awaitPromise=true to properly resolve the fetch Promise.
+            var cdpParams = JsonSerializer.Serialize(new { expression = script, awaitPromise = true, returnByValue = true });
+            var cdpResultJson = await _webView.CallDevToolsProtocolMethodAsync("Runtime.evaluate", cdpParams);
+
+            using var cdpDoc = JsonDocument.Parse(cdpResultJson);
+
+            // Check for CDP-level exception
+            if (cdpDoc.RootElement.TryGetProperty("exceptionDetails", out var excDetails))
             {
-                _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=empty_response url={(url.Length > 80 ? url[..80] : url)}");
+                var excText = excDetails.TryGetProperty("text", out var et) ? et.GetString() ?? "" : "";
+                _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=cdp_exception:{excText} url={(url.Length > 80 ? url[..80] : url)}");
                 return null;
             }
 
-            // === RAW RESULT DIAGNOSTICS ===
-            // Log the raw ExecuteScriptAsync result structure so we never guess again.
-            var trimmedRaw = raw.Trim();
-            var rawType = trimmedRaw.StartsWith("\"") ? "json_string" :
-                          trimmedRaw.StartsWith("{") ? "raw_object" :
-                          trimmedRaw.StartsWith("[") ? "raw_array" :
-                          trimmedRaw == "undefined" ? "undefined" :
-                          trimmedRaw == "null" ? "null" : "other";
-            _log.Write("JS_FETCH_RAW_TYPE", rawType);
-            _log.Write("JS_FETCH_RAW_LENGTH", raw.Length.ToString());
-            _log.Write("JS_FETCH_RAW_PREVIEW", raw.Length > 200 ? raw[..200] : raw);
+            if (!cdpDoc.RootElement.TryGetProperty("result", out var resultEl) ||
+                !resultEl.TryGetProperty("value", out var valueEl))
+            {
+                _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=no_value_in_cdp_result url={(url.Length > 80 ? url[..80] : url)}");
+                return null;
+            }
 
-            // ExecuteScriptAsync returns sync script results as a JSON-encoded string (starts with "),
-            // but async script results may return raw JSON directly (starts with { or [).
-            // JsonSerializer.Deserialize<string> fails on raw JSON with:
-            // "The JSON value could not be converted to System.String" — handle both cases.
-            string innerJson;
-            if (trimmedRaw.StartsWith("\""))
-            {
-                innerJson = JsonSerializer.Deserialize<string>(raw) ?? "";
-            }
-            else
-            {
-                innerJson = raw;
-            }
+            var innerJson = valueEl.GetString() ?? "";
+            _log.Write("JS_FETCH_CDP_RESULT", $"length={innerJson.Length} preview={(innerJson.Length > 100 ? innerJson[..100] : innerJson)}");
+
             if (string.IsNullOrEmpty(innerJson))
             {
                 _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=empty_inner_json url={(url.Length > 80 ? url[..80] : url)}");
@@ -930,19 +920,7 @@ public sealed class MediaCaptureService : IDisposable
                 return null;
             }
 
-            // Accept base64 from multiple possible field names (base64, data, result)
-            string base64Str = "";
-            if (root.TryGetProperty("base64", out var b64Prop))
-            {
-                base64Str = b64Prop.GetString() ?? "";
-            }
-            else if (root.TryGetProperty("data", out var dataProp))
-            {
-                var dataVal = dataProp.GetString() ?? "";
-                // If it's a data URL, strip the header
-                var commaIdx = dataVal.IndexOf(',');
-                base64Str = commaIdx >= 0 && dataVal.StartsWith("data:") ? dataVal[(commaIdx + 1)..] : dataVal;
-            }
+            string base64Str = root.TryGetProperty("base64", out var b64Prop) ? (b64Prop.GetString() ?? "") : "";
             if (string.IsNullOrEmpty(base64Str))
             {
                 _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=no_base64_field url={(url.Length > 80 ? url[..80] : url)} innerJson={(innerJson.Length > 200 ? innerJson[..200] : innerJson)}");
