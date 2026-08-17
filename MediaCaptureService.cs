@@ -773,7 +773,20 @@ public sealed class MediaCaptureService : IDisposable
                 return null;
             }
 
-            var innerJson = JsonSerializer.Deserialize<string>(raw) ?? "";
+            // ExecuteScriptAsync returns sync script results as a JSON-encoded string (starts with "),
+            // but async script results may return raw JSON directly (starts with { or [).
+            // JsonSerializer.Deserialize<string> fails on raw JSON with:
+            // "The JSON value could not be converted to System.String" — handle both cases.
+            string innerJson;
+            var trimmedRaw = raw.Trim();
+            if (trimmedRaw.StartsWith("\""))
+            {
+                innerJson = JsonSerializer.Deserialize<string>(raw) ?? "";
+            }
+            else
+            {
+                innerJson = raw;
+            }
             if (string.IsNullOrEmpty(innerJson))
             {
                 _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=empty_inner_json url={(url.Length > 80 ? url[..80] : url)}");
@@ -808,7 +821,7 @@ public sealed class MediaCaptureService : IDisposable
             var blobType = root.TryGetProperty("type", out var tpProp) ? tpProp.GetString() ?? "" : "";
 
             _log.Write("RESPONSE_BODY_RECEIVED", $"bytes={imageBytes.Length} blobSize={blobSize} type={blobType} source=JS_FETCH");
-            _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length}");
+            _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length} source=BLOB");
             return imageBytes;
         }
         catch (Exception ex)
