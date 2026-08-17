@@ -31,6 +31,12 @@ public sealed class MediaCaptureService : IDisposable
     // within a session (SHA-256 DB dedup handles cross-session; this avoids redundant fetches).
     private readonly HashSet<string> _processedSrcs = new();
 
+    // Tracks unread chat names that have been processed (opened + scanned) in this session.
+    // Prevents re-processing old unread chats every cycle — only NEW unreads are handled.
+    // A chat is added here after it's targeted (whether navigation succeeded or failed),
+    // so a failed chat won't be retried forever.
+    private readonly HashSet<string> _processedUnreadChats = new(StringComparer.OrdinalIgnoreCase);
+
     // Events for live dashboard
     public event Action<string>? CaptureStatusChanged;
     public event Action<string>? ScannerStatusChanged;
@@ -126,11 +132,16 @@ public sealed class MediaCaptureService : IDisposable
         // Uses WhatsApp's internal JS store via window.require('WAWebCollections').Chat
         // to get unreadCount directly — far more reliable than DOM badge scraping.
         // Falls back to DOM-based FindAndClickUnreadChat if the store is unavailable.
-        var node = await ExecuteScriptJsonAsync(Scripts.FindAndClickUnreadViaStore);
+        // Inject the list of already-processed unread chat names so the JS script
+        // only picks NEW unreads — not old ones that have been sitting unread forever.
+        var excludeNamesJson = JsonSerializer.Serialize(_processedUnreadChats);
+        var storeScript = Scripts.FindAndClickUnreadViaStore.Replace("__EXCLUDE_NAMES__", excludeNamesJson);
+        var node = await ExecuteScriptJsonAsync(storeScript);
         var storeSource = node?["source"]?.GetValue<string>() ?? "";
         var storeClicked = node?["clicked"]?.GetValue<bool>() ?? false;
         var storeChatCount = node?["storeChatCount"]?.GetValue<int>() ?? 0;
         var storeUnreadTotal = node?["storeUnreadTotal"]?.GetValue<int>() ?? 0;
+        var allUnreadTotal = node?["allUnreadTotal"]?.GetValue<int>() ?? -1;
 
         _log.Write("UNREAD_DETECTION_SOURCE", storeSource);
         _log.Write("UNREAD_DETECTION_CLICKED", storeClicked.ToString().ToLowerInvariant());
@@ -150,6 +161,9 @@ public sealed class MediaCaptureService : IDisposable
             }
         }
         _log.Write("STORE_UNREAD_TOTAL", storeUnreadTotal.ToString());
+        if (allUnreadTotal >= 0)
+            _log.Write("ALL_UNREAD_TOTAL", allUnreadTotal.ToString());
+        _log.Write("PROCESSED_UNREAD_COUNT", _processedUnreadChats.Count.ToString());
 
         if (!storeClicked)
         {
@@ -631,6 +645,15 @@ public sealed class MediaCaptureService : IDisposable
             UpdateStatus($"Processed: {customerName} — {saved} new, {duplicates} dup, {failed} failed");
 
         scan_complete:
+        // Mark this chat as processed so it won't be retried in future cycles.
+        // This applies whether navigation succeeded or failed — a failed chat
+        // shouldn't be retried forever every 15 seconds. Only NEW unreads
+        // (chats not in _processedUnreadChats) are picked in the next cycle.
+        if (!string.IsNullOrWhiteSpace(name))
+        {
+            _processedUnreadChats.Add(name);
+            _log.Write("CHAT_MARKED_PROCESSED", $"name={name} total_processed={_processedUnreadChats.Count}");
+        }
         _log.Write("SCAN_COMPLETE", $"total_saved={totalSaved} total_duplicates={totalDuplicates}");
         ScannerStatusChanged?.Invoke($"Done — {totalSaved} new, {totalDuplicates} dup");
         UpdateStatus($"Scan done — {totalSaved} new, {totalDuplicates} dup");
@@ -2214,13 +2237,13 @@ public sealed class MediaCaptureService : IDisposable
                     }
 
                     var chats = chatCollection.Chat.getModelsArray();
-                    var unreadChats = [];
+                    var allUnreadChats = [];
                     for (var i = 0; i < chats.length; i++) {
                         try {
                             var chat = chats[i];
                             var uc = chat.unreadCount || 0;
                             if (uc > 0) {
-                                unreadChats.push({
+                                allUnreadChats.push({
                                     id: (chat.id && chat.id._serialized) ? chat.id._serialized : '',
                                     name: chat.formattedTitle || chat.name || '',
                                     unreadCount: uc
@@ -2229,12 +2252,21 @@ public sealed class MediaCaptureService : IDisposable
                         } catch (e) {}
                     }
 
+                    // Filter out chats already processed in this session — only pick NEW unreads.
+                    // __EXCLUDE_NAMES__ is injected by C# from _processedUnreadChats HashSet.
+                    var excludeNames = __EXCLUDE_NAMES__;
+                    var unreadChats = allUnreadChats.filter(function(c) {
+                        var n = c.name || '';
+                        return n && excludeNames.indexOf(n) < 0;
+                    });
+
                     var pane = document.querySelector('#pane-side');
                     var domRows = pane ? pane.querySelectorAll('[data-testid="cell-frame-container"], [role="listitem"], div[data-id]') : [];
                     var chatRowsFound = domRows.length;
 
                     if (unreadChats.length === 0) {
-                        return JSON.stringify({ clicked: false, reason: 'no_unread_in_store', source: 'store', storeUnreadTotal: 0, storeUnreadChats: [], storeChatCount: chats.length, chatRowsFound: chatRowsFound, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
+                        var noUnreadReason = allUnreadChats.length > 0 ? 'no_new_unread_all_processed' : 'no_unread_in_store';
+                        return JSON.stringify({ clicked: false, reason: noUnreadReason, source: 'store', storeUnreadTotal: 0, allUnreadTotal: allUnreadChats.length, storeUnreadChats: [], storeChatCount: chats.length, chatRowsFound: chatRowsFound, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
                     }
 
                     var targetName = unreadChats[0].name;
