@@ -168,7 +168,41 @@ public sealed class MediaCaptureService : IDisposable
             var rowWithNumberHtml = node?["rowWithNumberHtml"]?.GetValue<string>() ?? "";
             if (!string.IsNullOrEmpty(rowWithNumberHtml))
                 _log.Write("ROW_WITH_NUMBER_HTML", rowWithNumberHtml);
-        }
+
+            // UNREAD_DIAGNOSTIC — detailed element info for first 5 rows
+            var unreadDiag = node?["unreadDiagnostic"]?.AsArray();
+            if (unreadDiag != null)
+            {
+                foreach (var diag in unreadDiag)
+                {
+                    var dIdx = diag?["index"]?.GetValue<int>() ?? 0;
+                    var dRowClass = diag?["rowClass"]?.GetValue<string>() ?? "";
+                    var dRowTestId = diag?["rowTestId"]?.GetValue<string>() ?? "";
+                    var dRowDataId = diag?["rowDataId"]?.GetValue<string>() ?? "";
+                    var dRowAria = diag?["rowAriaLabel"]?.GetValue<string>() ?? "";
+                    _log.Write("UNREAD_DIAGNOSTIC_ROW", $"index={dIdx} class={dRowClass} testId={dRowTestId} dataId={dRowDataId} aria={dRowAria}");
+                    var dElements = diag?["elements"]?.AsArray();
+                    if (dElements != null)
+                    {
+                        foreach (var el in dElements)
+                        {
+                            var elTag = el?["tag"]?.GetValue<string>() ?? "";
+                            var elCls = el?["cls"]?.GetValue<string>() ?? "";
+                            var elTestId = el?["testId"]?.GetValue<string>() ?? "";
+                            var elAria = el?["ariaLabel"]?.GetValue<string>() ?? "";
+                            var elTitle = el?["title"]?.GetValue<string>() ?? "";
+                            var elText = el?["text"]?.GetValue<string>() ?? "";
+                            var elW = el?["w"]?.GetValue<int>() ?? 0;
+                            var elH = el?["h"]?.GetValue<int>() ?? 0;
+                            var elBg = el?["bg"]?.GetValue<string>() ?? "";
+                            var elFw = el?["fw"]?.GetValue<string>() ?? "";
+                            var elColor = el?["color"]?.GetValue<string>() ?? "";
+                            _log.Write("UNREAD_DIAGNOSTIC_EL", $"tag={elTag} cls={elCls} testId={elTestId} aria={elAria} title={elTitle} text={elText} w={elW} h={elH} bg={elBg} fw={elFw} color={elColor}");
+                        }
+                    }
+                }
+            }
+            }
 
         // Marker ancestry diagnostics
         if (unreadMarkersFound > 0)
@@ -1158,6 +1192,61 @@ public sealed class MediaCaptureService : IDisposable
                             }
                         }
                     }
+                    // Method 7: Bold chat name — unread chats have bold font-weight (700 or 500).
+                    // WhatsApp Web renders unread chat names in bold. This is a strong signal
+                    // that doesn't depend on badge structure.
+                    if (!badge) {
+                        var nameSpans = item.querySelectorAll('span[title], span[dir="auto"]');
+                        for (var ns2 = 0; ns2 < nameSpans.length; ns2++) {
+                            var nsEl = nameSpans[ns2];
+                            var nsStyle = window.getComputedStyle(nsEl);
+                            var nsFw = nsStyle.fontWeight;
+                            if (nsFw === '700' || nsFw === '500' || nsFw === 'bold' || nsFw === '600') {
+                                badge = nsEl; unreadCount = 1; break;
+                            }
+                        }
+                    }
+                    // Method 8: Row-level unread class — check if any element has "unread" in class
+                    if (!badge) {
+                        var allEls3 = item.querySelectorAll('*');
+                        for (var u = 0; u < allEls3.length; u++) {
+                            var uEl = allEls3[u];
+                            var uCls = uEl.className || '';
+                            if (typeof uCls === 'string' && (uCls.indexOf('unread') >= 0 || uCls.indexOf('Unread') >= 0 || uCls.indexOf('UNREAD') >= 0)) {
+                                badge = uEl; unreadCount = 1; break;
+                            }
+                        }
+                    }
+                    // Method 9: Broader data-testid search — badge/notification/count/pill/indicator
+                    if (!badge) {
+                        var testIdEls = item.querySelectorAll('[data-testid]');
+                        for (var ti2 = 0; ti2 < testIdEls.length; ti2++) {
+                            var tid = (testIdEls[ti2].getAttribute('data-testid') || '').toLowerCase();
+                            if (tid.indexOf('unread') >= 0 || tid.indexOf('badge') >= 0 || tid.indexOf('notification') >= 0 || tid.indexOf('count') >= 0 || tid.indexOf('pill') >= 0 || tid.indexOf('indicator') >= 0) {
+                                badge = testIdEls[ti2];
+                                var tidText = (testIdEls[ti2].textContent || '').trim();
+                                unreadCount = /^\d+$/.test(tidText) ? parseInt(tidText) : 1;
+                                break;
+                            }
+                        }
+                    }
+                    // Method 10: Any small element with non-white/non-transparent background
+                    // — catches badges that use unexpected colors or structures
+                    if (!badge) {
+                        var allEls4 = item.querySelectorAll('span, div');
+                        for (var s2 = 0; s2 < allEls4.length; s2++) {
+                            var el2 = allEls4[s2];
+                            if (el2.offsetWidth <= 0 || el2.offsetWidth > 40) continue;
+                            var st2 = window.getComputedStyle(el2);
+                            var bg2 = st2.backgroundColor;
+                            if (bg2 && bg2 !== 'rgba(0, 0, 0, 0)' && bg2 !== 'transparent' && bg2 !== 'rgb(255, 255, 255)' && bg2 !== 'rgb(0, 0, 0, 0)') {
+                                var text2 = (el2.textContent || '').trim();
+                                if (/^\d+$/.test(text2) || text2 === '') {
+                                    badge = el2; unreadCount = text2 ? parseInt(text2) : 1; break;
+                                }
+                            }
+                        }
+                    }
                     return badge ? { badge: badge, unreadCount: unreadCount } : null;
                 }
 
@@ -1186,8 +1275,54 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
+                // === UNREAD_DIAGNOSTIC — dump detailed element info for first 5 rows ===
+                // When no unread markers are found, collect ALL element styles/attributes
+                // from the first 5 rows so we can see what WhatsApp actually renders.
+                var unreadDiagnostic = [];
+                if (unreadMarkersFound === 0 && chatRowsFound > 0) {
+                    for (var dIdx = 0; dIdx < Math.min(items.length, 5); dIdx++) {
+                        var dRow = items[dIdx];
+                        var dInfo = {
+                            index: dIdx,
+                            rowClass: (dRow.className || '').substring(0, 200),
+                            rowTestId: dRow.getAttribute('data-testid') || '',
+                            rowDataId: dRow.getAttribute('data-id') || '',
+                            rowAriaLabel: (dRow.getAttribute('aria-label') || '').substring(0, 120),
+                            elements: []
+                        };
+                        var dEls = dRow.querySelectorAll('span, div, button, svg');
+                        for (var dE = 0; dE < dEls.length && dE < 60; dE++) {
+                            var dEl = dEls[dE];
+                            var dStyle = window.getComputedStyle(dEl);
+                            var dBg = dStyle.backgroundColor;
+                            var dFw = dStyle.fontWeight;
+                            var dInfo2 = {
+                                tag: dEl.tagName,
+                                cls: (typeof dEl.className === 'string' ? dEl.className : '').substring(0, 100),
+                                testId: dEl.getAttribute('data-testid') || '',
+                                ariaLabel: (dEl.getAttribute('aria-label') || '').substring(0, 80),
+                                title: (dEl.getAttribute('title') || '').substring(0, 80),
+                                text: (dEl.textContent || '').trim().substring(0, 40),
+                                w: dEl.offsetWidth,
+                                h: dEl.offsetHeight,
+                                bg: dBg,
+                                fw: dFw,
+                                color: dStyle.color
+                            };
+                            // Only include elements with interesting properties
+                            if (dInfo2.testId || dInfo2.ariaLabel ||
+                                (dBg && dBg !== 'rgba(0, 0, 0, 0)' && dBg !== 'transparent' && dBg !== 'rgb(255, 255, 255)') ||
+                                (dFw !== '400' && dFw !== 'normal' && dFw !== '') ||
+                                /^\d+$/.test(dInfo2.text)) {
+                                dInfo.elements.push(dInfo2);
+                            }
+                        }
+                        unreadDiagnostic.push(dInfo);
+                    }
+                }
+
                 if (unreadMarkersFound === 0 || !firstUnreadBadge) {
-                    return JSON.stringify({ clicked: false, reason: 'no_unread', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', chatRowsFound: chatRowsFound, unreadMarkersFound: 0, markerHtml: markerHtml, parent1: parent1, parent2: parent2, parent3: parent3, matchedChatRow: false, matchedChatName: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false, rowHtml1: rowHtml1, rowHtml2: rowHtml2, rowHtml3: rowHtml3, rowWithNumberHtml: rowWithNumberHtml });
+                    return JSON.stringify({ clicked: false, reason: 'no_unread', name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', chatRowsFound: chatRowsFound, unreadMarkersFound: 0, markerHtml: markerHtml, parent1: parent1, parent2: parent2, parent3: parent3, matchedChatRow: false, matchedChatName: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false, rowHtml1: rowHtml1, rowHtml2: rowHtml2, rowHtml3: rowHtml3, rowWithNumberHtml: rowWithNumberHtml, unreadDiagnostic: unreadDiagnostic });
                 }
 
                 // === Resolve row + name from the SAME badge (atomic handoff) ===
