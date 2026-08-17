@@ -527,7 +527,7 @@ public sealed class MediaCaptureService : IDisposable
                 }
 
                 downloaded++;
-                _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length}");
+                _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length} source={(src.StartsWith("blob:") ? "BLOB" : src.StartsWith("data:") ? "DATA" : "HTTP")}");
 
                 // Reject small files (< 15KB) — these are thumbnails/avatars/stickers,
                 // not real customer photos. A typical WhatsApp photo is > 30KB.
@@ -650,7 +650,7 @@ public sealed class MediaCaptureService : IDisposable
                     return null;
                 }
                 _log.Write("DATA_URL_DECODED", $"bytes={bytes.Length}");
-                _log.Write("MEDIA_DOWNLOADED", $"bytes={bytes.Length}");
+                _log.Write("MEDIA_DOWNLOADED", $"bytes={bytes.Length} source=DATA");
                 return bytes;
             }
 
@@ -713,7 +713,7 @@ public sealed class MediaCaptureService : IDisposable
                         }
 
                         _log.Write("RESPONSE_BODY_RECEIVED", $"bytes={imageBytes.Length} base64Encoded={base64Encoded} source=CDP");
-                        _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length}");
+                        _log.Write("MEDIA_DOWNLOADED", $"bytes={imageBytes.Length} source=CDP");
                         return imageBytes;
                     }
                 }
