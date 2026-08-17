@@ -517,6 +517,28 @@ public sealed class MediaCaptureService : IDisposable
                 }
             }
 
+            // === DIAGNOSTICS: log every media candidate (img + video) with accept/reject ===
+            var diagArray = imagesNode?["diagnostics"]?.AsArray();
+            if (diagArray != null)
+            {
+                var accImg = 0; var accVid = 0; var profImg = 0;
+                foreach (var d in diagArray)
+                {
+                    var dt = d?["type"]?.GetValue<string>() ?? "";
+                    var ds = d?["srcType"]?.GetValue<string>() ?? "";
+                    var dtid = d?["containerTestId"]?.GetValue<string>() ?? "";
+                    var dw = d?["width"]?.GetValue<int>() ?? 0;
+                    var dh = d?["height"]?.GetValue<int>() ?? 0;
+                    var da = d?["accepted"]?.GetValue<bool>() ?? false;
+                    var dr = d?["rejectReason"]?.GetValue<string>() ?? "";
+                    var dih = d?["inHeader"]?.GetValue<bool>() ?? false;
+                    _log.Write("MEDIA_CANDIDATE", $"type={dt} srcType={ds} containerTestId={dtid} width={dw} height={dh} inHeader={dih}");
+                    if (da) { _log.Write("MEDIA_ACCEPTED", $"type={dt} source={ds}"); if (dt == "image") accImg++; else if (dt == "video") accVid++; }
+                    else { _log.Write("MEDIA_REJECTED", $"type={dt} reason={dr} srcType={ds} width={dw} height={dh} inHeader={dih}"); if (dih && dt == "image") profImg++; }
+                }
+                _log.Write("MEDIA_DIAGNOSTICS_SUMMARY", $"accepted_images={accImg} accepted_videos={accVid} profile_images={profImg} total={diagArray.Count}");
+            }
+
             if (images == null || images.Count == 0)
             {
                 var totalImgs = imagesNode?["totalImgs"]?.GetValue<int>() ?? 0;
@@ -2154,7 +2176,7 @@ public sealed class MediaCaptureService : IDisposable
         public const string DetectImages = """
             (() => {
                 const main = document.querySelector('#main');
-                if (!main) return JSON.stringify({ images: [], candidates: [], mainFound: false, totalImgs: 0, filteredSrc: 0, filteredSize: 0, filteredPlaceholder: 0, filteredDup: 0, filteredPreview: 0, messageGroups: 0 });
+                if (!main) return JSON.stringify({ images: [], candidates: [], diagnostics: [], mainFound: false, totalImgs: 0, totalVideos: 0, filteredSrc: 0, filteredSize: 0, filteredPlaceholder: 0, filteredDup: 0, filteredPreview: 0, filteredNotMessage: 0, messageGroups: 0 });
                 // ONLY include images inside message containers ([data-id] or msg-bubble).
                 // This is the inverse of trying to exclude the profile picture — instead of
                 // guessing where the profile avatar lives, we only capture images that are
@@ -2166,6 +2188,23 @@ public sealed class MediaCaptureService : IDisposable
                     return true;
                 });
                 const totalImgs = imgs.length;
+                // === DIAGNOSTICS: scan ALL media (img + video) for accept/reject logging ===
+                var diagnostics = [];
+                var totalVideos = main.querySelectorAll('video').length;
+                function diagEl(el, type) {
+                    var s = el.getAttribute('src') || '';
+                    var st = s.startsWith('blob:') ? 'BLOB' : s.startsWith('data:') ? 'DATA' : s.startsWith('http') ? 'HTTP' : 'OTHER';
+                    var c = el.closest('[data-id]') || el.closest('[data-testid="msg-bubble"]');
+                    var ih = !!(el.closest('header'));
+                    var w = type === 'video' ? (el.videoWidth || el.width || 0) : (el.naturalWidth || el.width || 0);
+                    var h = type === 'video' ? (el.videoHeight || el.height || 0) : (el.naturalHeight || el.height || 0);
+                    var inMsg = !!c;
+                    var acc = inMsg && st !== 'OTHER' && !s.startsWith('data:image/gif;base64,R0lGODlh') && !(w > 0 && h > 0 && w <= 80 && h <= 80);
+                    var rej = !inMsg ? (ih ? 'profile_image_or_header' : 'not_message_media') : (st === 'OTHER' ? 'invalid_src' : (s.startsWith('data:image/gif;base64,R0lGODlh') ? 'placeholder_gif' : ((w > 0 && h > 0 && w <= 80 && h <= 80) ? 'too_small' : '')));
+                    return { type: type, srcType: st, src: s.substring(0, 80), containerTestId: c ? (c.getAttribute('data-testid') || '') : '', containerDataId: c ? (c.getAttribute('data-id') || '') : '', inHeader: ih, inMessage: inMsg, width: w, height: h, accepted: acc, rejectReason: rej };
+                }
+                allImgs.forEach(function(im) { diagnostics.push(diagEl(im, 'image')); });
+                main.querySelectorAll('video').forEach(function(vi) { diagnostics.push(diagEl(vi, 'video')); });
                 const seen = new Set();
                 const allEntries = [];
                 const candidates = [];
@@ -2245,7 +2284,7 @@ public sealed class MediaCaptureService : IDisposable
                     }
                 }
 
-                return JSON.stringify({ images: images, candidates: candidates, mainFound: true, totalImgs: totalImgs, filteredSrc: filteredSrc, filteredSize: filteredSize, filteredPlaceholder: filteredPlaceholder, filteredDup: filteredDup, filteredPreview: filteredPreview, messageGroups: messageGroups.size });
+                return JSON.stringify({ images: images, candidates: candidates, diagnostics: diagnostics, mainFound: true, totalImgs: totalImgs, totalVideos: totalVideos, filteredSrc: filteredSrc, filteredSize: filteredSize, filteredPlaceholder: filteredPlaceholder, filteredDup: filteredDup, filteredPreview: filteredPreview, filteredNotMessage: 0, messageGroups: messageGroups.size });
             })();
             """;
 
