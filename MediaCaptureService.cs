@@ -31,11 +31,18 @@ public sealed class MediaCaptureService : IDisposable
     // within a session (SHA-256 DB dedup handles cross-session; this avoids redundant fetches).
     private readonly HashSet<string> _processedSrcs = new();
 
-    // Tracks unread chat names that have been processed (opened + scanned) in this session.
-    // Prevents re-processing old unread chats every cycle — only NEW unreads are handled.
-    // A chat is added here after it's targeted (whether navigation succeeded or failed),
-    // so a failed chat won't be retried forever.
-    private readonly HashSet<string> _processedUnreadChats = new(StringComparer.OrdinalIgnoreCase);
+    // Tracks unread EVENT keys that have been successfully processed in this session.
+    // Event key = chatId + "|" + lastMessageId — so the SAME customer sending NEW
+    // messages later creates a NEW event key and gets processed again.
+    private readonly HashSet<string> _processedEventKeys = new(StringComparer.OrdinalIgnoreCase);
+
+    // Failed events: retry count + cooldown. On failure, the event is NOT marked
+    // processed — it gets retried after a cooldown. After MaxEventRetries, we give
+    // up and mark it processed to avoid infinite loops.
+    private readonly Dictionary<string, int> _failedEventRetries = new(StringComparer.OrdinalIgnoreCase);
+    private readonly Dictionary<string, DateTime> _failedEventCooldowns = new(StringComparer.OrdinalIgnoreCase);
+    private const int MaxEventRetries = 3;
+    private static readonly TimeSpan FailedEventCooldown = TimeSpan.FromMinutes(2);
 
     // Events for live dashboard
     public event Action<string>? CaptureStatusChanged;
@@ -132,10 +139,20 @@ public sealed class MediaCaptureService : IDisposable
         // Uses WhatsApp's internal JS store via window.require('WAWebCollections').Chat
         // to get unreadCount directly — far more reliable than DOM badge scraping.
         // Falls back to DOM-based FindAndClickUnreadChat if the store is unavailable.
-        // Inject the list of already-processed unread chat names so the JS script
-        // only picks NEW unreads — not old ones that have been sitting unread forever.
-        var excludeNamesJson = JsonSerializer.Serialize(_processedUnreadChats);
-        var storeScript = Scripts.FindAndClickUnreadViaStore.Replace("__EXCLUDE_NAMES__", excludeNamesJson);
+        // Inject the list of already-processed event KEYS (chatId|lastMessageId) so
+        // the JS script only picks NEW unread events — not old ones already handled.
+        // Also include failed events still in cooldown (not yet ready to retry).
+        // The SAME customer sending NEW messages later gets a new lastMessageId →
+        // new eventKey → eligible for processing again (not blocked by name).
+        var excludeKeys = new HashSet<string>(_processedEventKeys, StringComparer.OrdinalIgnoreCase);
+        var now = DateTime.Now;
+        foreach (var kv in _failedEventCooldowns)
+        {
+            if (now < kv.Value && !excludeKeys.Contains(kv.Key))
+                excludeKeys.Add(kv.Key);
+        }
+        var excludeKeysJson = JsonSerializer.Serialize(excludeKeys);
+        var storeScript = Scripts.FindAndClickUnreadViaStore.Replace("__EXCLUDE_NAMES__", excludeKeysJson);
         var node = await ExecuteScriptJsonAsync(storeScript);
         var storeSource = node?["source"]?.GetValue<string>() ?? "";
         var storeClicked = node?["clicked"]?.GetValue<bool>() ?? false;
@@ -157,13 +174,15 @@ public sealed class MediaCaptureService : IDisposable
                 var ucId = uc?["id"]?.GetValue<string>() ?? "";
                 var ucName = uc?["name"]?.GetValue<string>() ?? "";
                 var ucCount = uc?["unreadCount"]?.GetValue<int>() ?? 0;
-                _log.Write("STORE_UNREAD_CHAT", $"id={ucId} name={ucName} unreadCount={ucCount}");
+                var ucKey = uc?["eventKey"]?.GetValue<string>() ?? "";
+                _log.Write("STORE_UNREAD_CHAT", $"id={ucId} name={ucName} unreadCount={ucCount} eventKey={ucKey}");
             }
         }
         _log.Write("STORE_UNREAD_TOTAL", storeUnreadTotal.ToString());
         if (allUnreadTotal >= 0)
             _log.Write("ALL_UNREAD_TOTAL", allUnreadTotal.ToString());
-        _log.Write("PROCESSED_UNREAD_COUNT", _processedUnreadChats.Count.ToString());
+        _log.Write("PROCESSED_EVENT_COUNT", _processedEventKeys.Count.ToString());
+        _log.Write("COOLDOWN_EVENT_COUNT", _failedEventCooldowns.Count.ToString());
 
         if (!storeClicked)
         {
@@ -174,6 +193,8 @@ public sealed class MediaCaptureService : IDisposable
         var unreadMarkersFound = node?["unreadMarkersFound"]?.GetValue<int>() ?? 0;
         var clicked = node?["clicked"]?.GetValue<bool>() ?? false;
         var name = node?["name"]?.GetValue<string>() ?? "";
+        var eventKey = node?["eventKey"]?.GetValue<string>() ?? "";
+        var chatId = node?["chatId"]?.GetValue<string>() ?? "";
         var clickTargetHtml = node?["clickTargetHtml"]?.GetValue<string>() ?? "";
         var clickTargetIndex = node?["clickTargetIndex"]?.GetValue<int>() ?? -1;
         var chatUnreadCount = node?["unreadCount"]?.GetValue<int>() ?? 0;
@@ -281,6 +302,11 @@ public sealed class MediaCaptureService : IDisposable
         ScannerStatusChanged?.Invoke($"Scanning {unreadMarkersFound} chats");
         var totalSaved = 0;
         var totalDuplicates = 0;
+        var scanSucceeded = false;
+
+        // Log the event key for this unread event — chatId + lastMessageId
+        if (!string.IsNullOrEmpty(eventKey))
+            _log.Write("UNREAD_EVENT_KEY", $"chatId={chatId} eventKey={eventKey} name={name}");
 
         // Handoff diagnostics — proves the row survived between detection and click
         _log.Write("UNREAD_HANDOFF_NAME", unreadHandoffName);
@@ -644,15 +670,43 @@ public sealed class MediaCaptureService : IDisposable
             CurrentChatChanged?.Invoke($"{customerName} — {saved} new, {duplicates} dup, {failed} failed");
             UpdateStatus($"Processed: {customerName} — {saved} new, {duplicates} dup, {failed} failed");
 
+            // Media scan completed — this unread event is handled.
+            scanSucceeded = true;
+
         scan_complete:
-        // Mark this chat as processed so it won't be retried in future cycles.
-        // This applies whether navigation succeeded or failed — a failed chat
-        // shouldn't be retried forever every 15 seconds. Only NEW unreads
-        // (chats not in _processedUnreadChats) are picked in the next cycle.
-        if (!string.IsNullOrWhiteSpace(name))
+        // Event-key-based tracking: only SUCCESS marks the event as processed.
+        // FAILURE sets a cooldown so the event can be retried — but the SAME
+        // customer sending NEW messages later gets a new eventKey and is
+        // always eligible for processing.
+        if (!string.IsNullOrEmpty(eventKey))
         {
-            _processedUnreadChats.Add(name);
-            _log.Write("CHAT_MARKED_PROCESSED", $"name={name} total_processed={_processedUnreadChats.Count}");
+            if (scanSucceeded)
+            {
+                _processedEventKeys.Add(eventKey);
+                _failedEventRetries.Remove(eventKey);
+                _failedEventCooldowns.Remove(eventKey);
+                _log.Write("UNREAD_EVENT_PROCESSED", $"eventKey={eventKey} name={name} total_processed={_processedEventKeys.Count}");
+            }
+            else
+            {
+                // Failure — retry with cooldown. After MaxEventRetries, give up
+                // and mark as processed to avoid infinite loops.
+                _failedEventRetries.TryGetValue(eventKey, out var retries);
+                retries++;
+                _failedEventRetries[eventKey] = retries;
+                if (retries >= MaxEventRetries)
+                {
+                    _processedEventKeys.Add(eventKey);
+                    _failedEventRetries.Remove(eventKey);
+                    _failedEventCooldowns.Remove(eventKey);
+                    _log.Write("UNREAD_EVENT_GIVEUP", $"eventKey={eventKey} name={name} retries={retries}");
+                }
+                else
+                {
+                    _failedEventCooldowns[eventKey] = DateTime.Now + FailedEventCooldown;
+                    _log.Write("UNREAD_EVENT_RETRY", $"eventKey={eventKey} name={name} retries={retries} cooldown_min=2");
+                }
+            }
         }
         _log.Write("SCAN_COMPLETE", $"total_saved={totalSaved} total_duplicates={totalDuplicates}");
         ScannerStatusChanged?.Invoke($"Done — {totalSaved} new, {totalDuplicates} dup");
@@ -2243,21 +2297,29 @@ public sealed class MediaCaptureService : IDisposable
                             var chat = chats[i];
                             var uc = chat.unreadCount || 0;
                             if (uc > 0) {
+                                var lmid = '';
+                                try { lmid = (chat.lastReceivedKey && chat.lastReceivedKey._serialized) ? chat.lastReceivedKey._serialized : ''; } catch(e) {}
+                                if (!lmid) { try { lmid = String(chat.t || 0); } catch(e) {} }
+                                var cid = (chat.id && chat.id._serialized) ? chat.id._serialized : '';
                                 allUnreadChats.push({
-                                    id: (chat.id && chat.id._serialized) ? chat.id._serialized : '',
+                                    id: cid,
                                     name: chat.formattedTitle || chat.name || '',
-                                    unreadCount: uc
+                                    unreadCount: uc,
+                                    eventKey: cid + '|' + lmid
                                 });
                             }
                         } catch (e) {}
                     }
 
-                    // Filter out chats already processed in this session — only pick NEW unreads.
-                    // __EXCLUDE_NAMES__ is injected by C# from _processedUnreadChats HashSet.
-                    var excludeNames = __EXCLUDE_NAMES__;
+                    // Filter out events already processed in this session — only pick NEW unreads.
+                    // __EXCLUDE_NAMES__ is injected by C# from _processedEventKeys HashSet
+                    // (eventKey = chatId|lastMessageId, NOT chat name).
+                    // The SAME customer sending NEW messages later gets a new lastMessageId
+                    // → new eventKey → eligible for processing again.
+                    var excludeKeys = __EXCLUDE_NAMES__;
                     var unreadChats = allUnreadChats.filter(function(c) {
-                        var n = c.name || '';
-                        return n && excludeNames.indexOf(n) < 0;
+                        var k = c.eventKey || '';
+                        return k && excludeKeys.indexOf(k) < 0;
                     });
 
                     var pane = document.querySelector('#pane-side');
@@ -2315,6 +2377,7 @@ public sealed class MediaCaptureService : IDisposable
                          (activeChatBefore.length > 2 && targetName.indexOf(activeChatBefore) >= 0))) {
                         return JSON.stringify({
                             clicked: true, source: 'store', name: targetName,
+                            eventKey: unreadChats[0].eventKey, chatId: unreadChats[0].id,
                             storeUnreadTotal: unreadChats.length, storeUnreadChats: unreadChats, storeChatCount: chats.length,
                             chatRowsFound: chatRowsFound, unreadMarkersFound: unreadChats.length,
                             clickTargetHtml: '', clickTargetIndex: clickedIndex, unreadCount: unreadChats[0].unreadCount,
@@ -2369,6 +2432,7 @@ public sealed class MediaCaptureService : IDisposable
 
                     return JSON.stringify({
                         clicked: true, source: 'store', name: targetName,
+                        eventKey: unreadChats[0].eventKey, chatId: unreadChats[0].id,
                         storeUnreadTotal: unreadChats.length, storeUnreadChats: unreadChats, storeChatCount: chats.length,
                         chatRowsFound: chatRowsFound, unreadMarkersFound: unreadChats.length,
                         clickTargetHtml: (clickedRow.outerHTML || '').substring(0, 300),
