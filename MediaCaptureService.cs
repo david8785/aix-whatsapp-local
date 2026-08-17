@@ -388,6 +388,8 @@ public sealed class MediaCaptureService : IDisposable
                 goto scan_complete;
             }
 
+            _log.Write("MEDIA_SCAN_STARTED_AFTER_UNREAD_OPEN", $"chat={activeChatName}");
+
             // Confirmed correct chat — use verified active name as customer name
             var customerName = activeChatName;
 
@@ -442,6 +444,7 @@ public sealed class MediaCaptureService : IDisposable
             // Detect images in the current chat
             var imagesNode = await ExecuteScriptJsonAsync(Scripts.DetectImages);
             var images = imagesNode?["images"]?.AsArray();
+            _log.Write("MEDIA_CANDIDATES_FOUND", $"{images?.Count ?? 0}");
 
             // Log skipped placeholder GIFs, duplicate srcs, and filtered previews
             var filteredPlaceholder = imagesNode?["filteredPlaceholder"]?.GetValue<int>() ?? 0;
@@ -512,6 +515,8 @@ public sealed class MediaCaptureService : IDisposable
                     continue;
                 }
 
+                _log.Write("MEDIA_DOWNLOAD_STARTED", $"src={srcShort}");
+
                 // Download real image bytes via JavaScript fetch
                 var imageBytes = await DownloadImageAsync(src);
                 if (imageBytes == null || imageBytes.Length == 0)
@@ -581,6 +586,7 @@ public sealed class MediaCaptureService : IDisposable
                 {
                     var imageIndex = CustomerFolderService.GetNextImageIndex(folderPath);
                     var localPath = CustomerFolderService.SaveImage(folderPath, imageBytes, imageIndex);
+                    _log.Write("DAILY_FOLDER_CREATED", folderPath);
                     _log.Write("FILE_SAVED", $"path={localPath}");
                     LastSavedFileChanged?.Invoke(localPath);
 
@@ -2168,7 +2174,7 @@ public sealed class MediaCaptureService : IDisposable
         /// Returns the same fields as FindAndClickUnreadChat for seamless integration.
         /// </summary>
         public const string FindAndClickUnreadViaStore = """
-            (async () => {
+            (() => {
                 try {
                     if (typeof window.require !== 'function') {
                         return JSON.stringify({ clicked: false, reason: 'no_window_require', source: 'store', storeUnreadTotal: 0, storeUnreadChats: [], storeChatCount: 0, chatRowsFound: 0, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
@@ -2274,17 +2280,9 @@ public sealed class MediaCaptureService : IDisposable
                     try { clickTarget.focus(); } catch(e) {}
                     fire('click', MouseEvent);
 
-                    await new Promise(function(r) { setTimeout(r, 1500); });
-
-                    var activeChatAfter = getActiveChatName();
-                    var navigationConfirmed = false;
-                    if (activeChatAfter && targetName) {
-                        if (activeChatAfter === targetName ||
-                            (targetName.length > 2 && activeChatAfter.indexOf(targetName) >= 0) ||
-                            (activeChatAfter.length > 2 && targetName.indexOf(activeChatAfter) >= 0)) {
-                            navigationConfirmed = true;
-                        }
-                    }
+                    // Navigation verification is handled by C# (Task.Delay + VerifyNavigation script)
+                    // to keep this script synchronous — WebView2 ExecuteScriptAsync does not reliably
+                    // resolve async scripts (Promise not resolved → all fields return empty/default).
 
                     return JSON.stringify({
                         clicked: true, source: 'store', name: targetName,
@@ -2293,8 +2291,8 @@ public sealed class MediaCaptureService : IDisposable
                         clickTargetHtml: (clickedRow.outerHTML || '').substring(0, 300),
                         clickTargetIndex: clickedIndex, unreadCount: unreadChats[0].unreadCount,
                         atomicClickTargetName: targetName, atomicClickConnected: true, atomicClickUnreadPresent: true,
-                        activeChatBefore: activeChatBefore, activeChatAfter: activeChatAfter,
-                        navigationConfirmed: navigationConfirmed, clickStrategy: strategy,
+                        activeChatBefore: activeChatBefore, activeChatAfter: activeChatBefore,
+                        navigationConfirmed: false, clickStrategy: strategy,
                         clickElementTag: clickElementTag, clickElementRole: clickElementRole, clickElementTabindex: clickElementTabindex,
                         unreadHandoffName: targetName, unreadHandoffRowConnected: true, unreadHandoffBadgeStillPresent: true,
                         clickAttempted: true
