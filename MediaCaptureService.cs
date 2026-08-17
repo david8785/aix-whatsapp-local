@@ -756,22 +756,27 @@ public sealed class MediaCaptureService : IDisposable
         try
         {
             var urlJson = JsonSerializer.Serialize(url);
+            // Use arrayBuffer + btoa instead of FileReader — more reliable for blob: URLs.
+            // FileReader.readAsDataURL can silently fail to fire onloadend for blob: in WebView2.
+            // arrayBuffer + chunked btoa always produces a valid base64 string.
             var script = $$"""
                 (async () => {
                     try {
                         const response = await fetch({{urlJson}});
                         if (!response.ok) return JSON.stringify({ error: 'HTTP ' + response.status });
-                        const blob = await response.blob();
-                        if (blob.size === 0) return JSON.stringify({ error: 'empty_blob' });
-                        return await new Promise(resolve => {
-                            const reader = new FileReader();
-                            reader.onloadend = () => {
-                                const base64 = reader.result.split(',')[1];
-                                resolve(JSON.stringify({ base64: base64, size: blob.size, type: blob.type }));
-                            };
-                            reader.onerror = () => resolve(JSON.stringify({ error: 'FileReader error' }));
-                            reader.readAsDataURL(blob);
-                        });
+                        const buf = await response.arrayBuffer();
+                        if (buf.byteLength === 0) return JSON.stringify({ error: 'empty_buffer' });
+                        const bytes = new Uint8Array(buf);
+                        // Chunked base64 encoding — avoids call stack limit on large images
+                        let binary = '';
+                        const chunkSize = 8192;
+                        for (let i = 0; i < bytes.length; i += chunkSize) {
+                            const chunk = bytes.subarray(i, Math.min(i + chunkSize, bytes.length));
+                            binary += String.fromCharCode.apply(null, chunk);
+                        }
+                        const base64 = btoa(binary);
+                        const contentType = response.headers.get('content-type') || 'application/octet-stream';
+                        return JSON.stringify({ base64: base64, size: bytes.length, type: contentType });
                     } catch (e) {
                         return JSON.stringify({ error: e.message });
                     }
@@ -785,12 +790,23 @@ public sealed class MediaCaptureService : IDisposable
                 return null;
             }
 
+            // === RAW RESULT DIAGNOSTICS ===
+            // Log the raw ExecuteScriptAsync result structure so we never guess again.
+            var trimmedRaw = raw.Trim();
+            var rawType = trimmedRaw.StartsWith("\"") ? "json_string" :
+                          trimmedRaw.StartsWith("{") ? "raw_object" :
+                          trimmedRaw.StartsWith("[") ? "raw_array" :
+                          trimmedRaw == "undefined" ? "undefined" :
+                          trimmedRaw == "null" ? "null" : "other";
+            _log.Write("JS_FETCH_RAW_TYPE", rawType);
+            _log.Write("JS_FETCH_RAW_LENGTH", raw.Length.ToString());
+            _log.Write("JS_FETCH_RAW_PREVIEW", raw.Length > 200 ? raw[..200] : raw);
+
             // ExecuteScriptAsync returns sync script results as a JSON-encoded string (starts with "),
             // but async script results may return raw JSON directly (starts with { or [).
             // JsonSerializer.Deserialize<string> fails on raw JSON with:
             // "The JSON value could not be converted to System.String" — handle both cases.
             string innerJson;
-            var trimmedRaw = raw.Trim();
             if (trimmedRaw.StartsWith("\""))
             {
                 innerJson = JsonSerializer.Deserialize<string>(raw) ?? "";
@@ -815,16 +831,22 @@ public sealed class MediaCaptureService : IDisposable
                 return null;
             }
 
-            if (!root.TryGetProperty("base64", out var b64Prop))
+            // Accept base64 from multiple possible field names (base64, data, result)
+            string base64Str = "";
+            if (root.TryGetProperty("base64", out var b64Prop))
             {
-                _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=no_base64_field url={(url.Length > 80 ? url[..80] : url)}");
-                return null;
+                base64Str = b64Prop.GetString() ?? "";
             }
-
-            var base64Str = b64Prop.GetString() ?? "";
+            else if (root.TryGetProperty("data", out var dataProp))
+            {
+                var dataVal = dataProp.GetString() ?? "";
+                // If it's a data URL, strip the header
+                var commaIdx = dataVal.IndexOf(',');
+                base64Str = commaIdx >= 0 && dataVal.StartsWith("data:") ? dataVal[(commaIdx + 1)..] : dataVal;
+            }
             if (string.IsNullOrEmpty(base64Str))
             {
-                _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=empty_base64 url={(url.Length > 80 ? url[..80] : url)}");
+                _log.Write("MEDIA_FAILURE", $"stage=JS_FETCH reason=no_base64_field url={(url.Length > 80 ? url[..80] : url)} innerJson={(innerJson.Length > 200 ? innerJson[..200] : innerJson)}");
                 return null;
             }
 
