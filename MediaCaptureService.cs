@@ -284,15 +284,21 @@ public sealed class MediaCaptureService : IDisposable
         // The atomic click script is synchronous (no Promise/await) because WebView2
         // ExecuteScriptAsync does not reliably resolve async scripts. Navigation
         // is verified here after a delay, using a separate synchronous script.
-        await Task.Delay(2000);
-        var navNode = await ExecuteScriptJsonAsync(Scripts.VerifyNavigation);
-        activeChatAfter = navNode?["activeChatName"]?.GetValue<string>() ?? "";
-        // Fuzzy match — header name may be truncated or differ slightly from chat list title.
-        // Accept if one contains the other (handles truncation + minor formatting differences).
-        navigationConfirmed = !string.IsNullOrWhiteSpace(activeChatAfter) &&
-            (string.Equals(activeChatAfter, name, StringComparison.OrdinalIgnoreCase) ||
-             (name.Length > 3 && activeChatAfter.Contains(name)) ||
-             (activeChatAfter.Length > 3 && name.Contains(activeChatAfter)));
+        //
+        // Skip verification if the script already confirmed navigation — this happens
+        // when the target chat was already the active chat (clickStrategy: 'already_active').
+        if (!navigationConfirmed)
+        {
+            await Task.Delay(2000);
+            var navNode = await ExecuteScriptJsonAsync(Scripts.VerifyNavigation);
+            activeChatAfter = navNode?["activeChatName"]?.GetValue<string>() ?? "";
+            // Fuzzy match — header name may be truncated or differ slightly from chat list title.
+            // Accept if one contains the other (handles truncation + minor formatting differences).
+            navigationConfirmed = !string.IsNullOrWhiteSpace(activeChatAfter) &&
+                (string.Equals(activeChatAfter, name, StringComparison.OrdinalIgnoreCase) ||
+                 (name.Length > 3 && activeChatAfter.Contains(name)) ||
+                 (activeChatAfter.Length > 3 && name.Contains(activeChatAfter)));
+        }
 
         // === CHAT SELECTION VERIFICATION ===
         _log.Write("MATCHED_CHAT_NAME", name);
@@ -2243,6 +2249,29 @@ public sealed class MediaCaptureService : IDisposable
                     }
 
                     var activeChatBefore = getActiveChatName();
+
+                    // If the target chat is ALREADY the active chat, skip the click.
+                    // Clicking an already-active row can cause WhatsApp to navigate
+                    // to a different chat — the click lands on the wrong element
+                    // after scroll repositioning. The chat is already open, so we
+                    // can proceed directly to media scanning.
+                    if (activeChatBefore && targetName &&
+                        (activeChatBefore === targetName ||
+                         (targetName.length > 2 && activeChatBefore.indexOf(targetName) >= 0) ||
+                         (activeChatBefore.length > 2 && targetName.indexOf(activeChatBefore) >= 0))) {
+                        return JSON.stringify({
+                            clicked: true, source: 'store', name: targetName,
+                            storeUnreadTotal: unreadChats.length, storeUnreadChats: unreadChats, storeChatCount: chats.length,
+                            chatRowsFound: chatRowsFound, unreadMarkersFound: unreadChats.length,
+                            clickTargetHtml: '', clickTargetIndex: clickedIndex, unreadCount: unreadChats[0].unreadCount,
+                            atomicClickTargetName: targetName, atomicClickConnected: true, atomicClickUnreadPresent: true,
+                            activeChatBefore: activeChatBefore, activeChatAfter: activeChatBefore,
+                            navigationConfirmed: true, clickStrategy: 'already_active',
+                            clickElementTag: '', clickElementRole: '', clickElementTabindex: '',
+                            unreadHandoffName: targetName, unreadHandoffRowConnected: true, unreadHandoffBadgeStillPresent: true,
+                            clickAttempted: false
+                        });
+                    }
 
                     try { clickedRow.scrollIntoView({block: 'center'}); } catch(e) {}
 
