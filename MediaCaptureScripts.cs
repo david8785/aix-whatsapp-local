@@ -1165,23 +1165,26 @@ internal static class MediaCaptureScripts
                     } catch (e) {}
                 }
 
-                var excludeKeys = __EXCLUDE_NAMES__;
-                var unreadChats = allUnreadChats.filter(function(c) {
-                    var k = c.eventKey || '';
-                    return k && excludeKeys.indexOf(k) < 0;
-                });
-
-                var pane = document.querySelector('#pane-side');
-                var domRows = pane ? pane.querySelectorAll('[data-testid="cell-frame-container"], [role="listitem"], div[data-id]') : [];
-                var chatRowsFound = domRows.length;
-
-                if (unreadChats.length === 0) {
-                    var noUnreadReason = allUnreadChats.length > 0 ? 'no_new_unread_all_processed' : 'no_unread_in_store';
-                    return JSON.stringify({ clicked: false, reason: noUnreadReason, source: 'store', storeUnreadTotal: 0, allUnreadTotal: allUnreadChats.length, storeUnreadChats: [], storeChatCount: chats.length, chatRowsFound: chatRowsFound, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
+                // === DIAGNOSTICS: top 20 chats by timestamp (newest first) ===
+                // Proves whether new messages arrive even when unreadCount=0
+                // (WhatsApp Web auto-marks messages as read when window is focused).
+                var allChatsForDiag = [];
+                for (var di = 0; di < chats.length; di++) {
+                    try {
+                        var dc = chats[di];
+                        var dcId = (dc.id && dc.id._serialized) ? dc.id._serialized : '';
+                        var dcName = dc.formattedTitle || dc.name || '';
+                        var dcUnread = dc.unreadCount || 0;
+                        var dcT = 0; try { dcT = dc.t || 0; } catch(e) {}
+                        var dcLmid = ''; try { dcLmid = (dc.lastReceivedKey && dc.lastReceivedKey._serialized) ? dc.lastReceivedKey._serialized : ''; } catch(e) {}
+                        if (!dcLmid) { try { dcLmid = String(dc.t || 0); } catch(e) {} }
+                        var dcMuted = false; try { dcMuted = !!(dc.mute && dc.mute.isMuted); } catch(e) {}
+                        var dcArchived = false; try { dcArchived = !!dc.archive; } catch(e) {}
+                        allChatsForDiag.push({ id: dcId, name: dcName, unreadCount: dcUnread, lastMessageId: dcLmid, t: dcT, muted: dcMuted, archived: dcArchived });
+                    } catch(e) {}
                 }
-
-                var targetChatId = unreadChats[0].id || '';
-                var targetName = unreadChats[0].name;
+                allChatsForDiag.sort(function(a, b) { return (b.t || 0) - (a.t || 0); });
+                var storeTopChats = allChatsForDiag.slice(0, 20);
 
                 function getActiveChatName() {
                     var main = document.querySelector('#main');
@@ -1196,6 +1199,24 @@ internal static class MediaCaptureScripts
                 }
 
                 var activeChatBefore = getActiveChatName();
+
+                var excludeKeys = __EXCLUDE_NAMES__;
+                var unreadChats = allUnreadChats.filter(function(c) {
+                    var k = c.eventKey || '';
+                    return k && excludeKeys.indexOf(k) < 0;
+                });
+
+                var pane = document.querySelector('#pane-side');
+                var domRows = pane ? pane.querySelectorAll('[data-testid="cell-frame-container"], [role="listitem"], div[data-id]') : [];
+                var chatRowsFound = domRows.length;
+
+                if (unreadChats.length === 0) {
+                    var noUnreadReason = allUnreadChats.length > 0 ? 'no_new_unread_all_processed' : 'no_unread_in_store';
+                    return JSON.stringify({ clicked: false, reason: noUnreadReason, source: 'store', storeUnreadTotal: 0, allUnreadTotal: allUnreadChats.length, storeUnreadChats: [], storeChatCount: chats.length, storeTopChats: storeTopChats, chatRowsFound: chatRowsFound, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
+                }
+
+                var targetChatId = unreadChats[0].id || '';
+                var targetName = unreadChats[0].name;
 
                 // === ALREADY-ACTIVE CHECK (before row matching) ===
                 // If the target chat is ALREADY the active chat, skip the click entirely.

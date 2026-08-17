@@ -31,6 +31,10 @@ public sealed class MediaCaptureService : IDisposable
     // within a session (SHA-256 DB dedup handles cross-session; this avoids redundant fetches).
     private readonly HashSet<string> _processedSrcs = new();
 
+    // Diagnostics: track lastMessageId per chat across scans to detect new messages
+    // even when unreadCount=0 (WhatsApp Web auto-marks messages as read when focused).
+    private readonly Dictionary<string, string> _lastMessageIds = new(StringComparer.OrdinalIgnoreCase);
+
     // Tracks unread EVENT keys that have been successfully processed in this session.
     // Event key = chatId + "|" + lastMessageId — so the SAME customer sending NEW
     // messages later creates a NEW event key and gets processed again.
@@ -160,6 +164,32 @@ public sealed class MediaCaptureService : IDisposable
                 _log.Write("STORE_UNREAD_CHAT", $"id={ucId} name={ucName} unreadCount={ucCount} eventKey={ucKey}");
             }
         }
+        // === DIAGNOSTICS: log top 20 chats + detect new messages by lastMessageId change ===
+        var storeTopChats = node?["storeTopChats"]?.AsArray();
+        if (storeTopChats != null)
+        {
+            foreach (var tc in storeTopChats)
+            {
+                var tcId = tc?["id"]?.GetValue<string>() ?? "";
+                var tcName = tc?["name"]?.GetValue<string>() ?? "";
+                var tcUnread = tc?["unreadCount"]?.GetValue<int>() ?? 0;
+                var tcLmid = tc?["lastMessageId"]?.GetValue<string>() ?? "";
+                var tcT = tc?["t"]?.ToString() ?? "0";
+                var tcMuted = tc?["muted"]?.GetValue<bool>() ?? false;
+                var tcArchived = tc?["archived"]?.GetValue<bool>() ?? false;
+                _log.Write("STORE_TOP_CHAT", $"id={tcId} name={tcName} unread={tcUnread} lastMsg={tcLmid} t={tcT} muted={tcMuted} archived={tcArchived}");
+
+                if (!string.IsNullOrEmpty(tcId) && !string.IsNullOrEmpty(tcLmid))
+                {
+                    if (_lastMessageIds.TryGetValue(tcId, out var prevLmid) && prevLmid != tcLmid)
+                    {
+                        _log.Write("NEW_MESSAGE_BY_LASTMSG_CHANGE", $"chatId={tcId} name={tcName} old={prevLmid} new={tcLmid} unread={tcUnread}");
+                    }
+                    _lastMessageIds[tcId] = tcLmid;
+                }
+            }
+        }
+        _log.Write("ACTIVE_CHAT_FROM_STORE", node?["activeChatBefore"]?.GetValue<string>() ?? "");
         _log.Write("STORE_UNREAD_TOTAL", storeUnreadTotal.ToString());
         if (allUnreadTotal >= 0)
             _log.Write("ALL_UNREAD_TOTAL", allUnreadTotal.ToString());
