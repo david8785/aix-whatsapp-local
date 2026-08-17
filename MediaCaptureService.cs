@@ -492,7 +492,8 @@ public sealed class MediaCaptureService : IDisposable
             await Task.Delay(2000);
 
             // Detect images in the current chat
-            var imagesNode = await ExecuteScriptJsonAsync(Scripts.DetectImages);
+            var detectScript = Scripts.DetectImages.Replace("__UNREAD_COUNT__", chatUnreadCount.ToString());
+            var imagesNode = await ExecuteScriptJsonAsync(detectScript);
             var images = imagesNode?["images"]?.AsArray();
             _log.Write("MEDIA_CANDIDATES_FOUND", $"{images?.Count ?? 0}");
 
@@ -500,6 +501,8 @@ public sealed class MediaCaptureService : IDisposable
             var filteredPlaceholder = imagesNode?["filteredPlaceholder"]?.GetValue<int>() ?? 0;
             var filteredDup = imagesNode?["filteredDup"]?.GetValue<int>() ?? 0;
             var filteredPreview = imagesNode?["filteredPreview"]?.GetValue<int>() ?? 0;
+            var filteredOutgoing = imagesNode?["filteredOutgoing"]?.GetValue<int>() ?? 0;
+            var filteredOld = imagesNode?["filteredOld"]?.GetValue<int>() ?? 0;
             var messageGroups = imagesNode?["messageGroups"]?.GetValue<int>() ?? 0;
             if (filteredPlaceholder > 0)
                 _log.Write("MEDIA_SKIPPED", $"reason=placeholder_gif count={filteredPlaceholder}");
@@ -507,6 +510,10 @@ public sealed class MediaCaptureService : IDisposable
                 _log.Write("MEDIA_DUPLICATE_SRC", $"count={filteredDup}");
             if (filteredPreview > 0)
                 _log.Write("MEDIA_SKIPPED", $"reason=preview_or_thumbnail count={filteredPreview}");
+            if (filteredOutgoing > 0)
+                _log.Write("MEDIA_SKIPPED", $"reason=outgoing_message count={filteredOutgoing}");
+            if (filteredOld > 0)
+                _log.Write("MEDIA_SKIPPED", $"reason=old_message count={filteredOld}");
 
             // Log classification for every candidate (ORIGINAL/PREVIEW/UNKNOWN)
             var candidates = imagesNode?["candidates"]?.AsArray();
@@ -530,15 +537,20 @@ public sealed class MediaCaptureService : IDisposable
                 {
                     var dt = d?["type"]?.GetValue<string>() ?? "";
                     var ds = d?["srcType"]?.GetValue<string>() ?? "";
-                    var dtid = d?["containerTestId"]?.GetValue<string>() ?? "";
+                    var dDir = d?["direction"]?.GetValue<string>() ?? "";
+                    var dMid = d?["messageId"]?.GetValue<string>() ?? "";
+                    var dMts = d?["messageTimestamp"]?.GetValue<string>() ?? "";
                     var dw = d?["width"]?.GetValue<int>() ?? 0;
                     var dh = d?["height"]?.GetValue<int>() ?? 0;
                     var da = d?["accepted"]?.GetValue<bool>() ?? false;
                     var dr = d?["rejectReason"]?.GetValue<string>() ?? "";
                     var dih = d?["inHeader"]?.GetValue<bool>() ?? false;
-                    _log.Write("MEDIA_CANDIDATE", $"type={dt} srcType={ds} containerTestId={dtid} width={dw} height={dh} inHeader={dih}");
-                    if (da) { _log.Write("MEDIA_ACCEPTED", $"type={dt} source={ds}"); if (dt == "image") accImg++; else if (dt == "video") accVid++; }
-                    else { _log.Write("MEDIA_REJECTED", $"type={dt} reason={dr} srcType={ds} width={dw} height={dh} inHeader={dih}"); if (dih && dt == "image") profImg++; }
+                    _log.Write("MESSAGE_DIRECTION", dDir);
+                    _log.Write("MESSAGE_ID", dMid);
+                    _log.Write("MESSAGE_TIMESTAMP", dMts);
+                    _log.Write("MEDIA_CANDIDATE", $"type={dt} srcType={ds} direction={dDir} messageId={dMid} width={dw} height={dh} inHeader={dih}");
+                    if (da) { _log.Write("MEDIA_ACCEPTED_REASON", "new_incoming"); if (dt == "image") accImg++; else if (dt == "video") accVid++; }
+                    else { _log.Write("MEDIA_REJECTED_REASON", dr); if (dih && dt == "image") profImg++; }
                 }
                 _log.Write("MEDIA_DIAGNOSTICS_SUMMARY", $"accepted_images={accImg} accepted_videos={accVid} profile_images={profImg} total={diagArray.Count}");
             }
@@ -2158,103 +2170,73 @@ public sealed class MediaCaptureService : IDisposable
         public const string DetectImages = """
             (() => {
                 const main = document.querySelector('#main');
-                if (!main) return JSON.stringify({ images: [], candidates: [], diagnostics: [], mainFound: false, totalImgs: 0, totalVideos: 0, filteredSrc: 0, filteredSize: 0, filteredPlaceholder: 0, filteredDup: 0, filteredPreview: 0, filteredNotMessage: 0, messageGroups: 0 });
-                // ONLY include images inside message containers ([data-id] or msg-bubble).
-                // This is the inverse of trying to exclude the profile picture — instead of
-                // guessing where the profile avatar lives, we only capture images that are
-                // definitively inside a message bubble. Profile pictures, call buttons,
-                // stickers, emoji, and all non-message UI images are automatically excluded.
+                if (!main) return JSON.stringify({ images: [], candidates: [], diagnostics: [], mainFound: false, totalImgs: 0, totalVideos: 0, filteredSrc: 0, filteredSize: 0, filteredPlaceholder: 0, filteredDup: 0, filteredPreview: 0, filteredOutgoing: 0, filteredOld: 0, messageGroups: 0 });
+                const unreadCount = __UNREAD_COUNT__;
+                // Direction: walk up ancestors looking for class message-in / message-out.
+                // Only message-in (incoming from customer) images are saved.
+                // message-out (sent by us) images are rejected as outgoing_message.
+                function getDir(el) {
+                    var n = el;
+                    for (var i = 0; i < 15 && n; i++) {
+                        var c = (typeof n.className === 'string') ? n.className : '';
+                        if (c.indexOf('message-in') >= 0) return 'incoming';
+                        if (c.indexOf('message-out') >= 0) return 'outgoing';
+                        n = n.parentElement;
+                    }
+                    return 'unknown';
+                }
+                function getMC(el) { return el.closest('[data-testid="msg-container"]') || el.closest('[data-id]') || el.closest('[data-testid="msg-bubble"]'); }
+                function getTS(mc) { var t = mc ? mc.querySelector('time[datetime]') : null; return t ? (t.getAttribute('datetime') || '') : ''; }
+                // Collect all message containers, classify direction, keep only incoming.
+                var allMC = main.querySelectorAll('[data-testid="msg-container"], div[data-id]');
+                var inMC = [], filteredOutgoing = 0;
+                allMC.forEach(function(mc) { var d = getDir(mc); if (d === 'incoming') inMC.push(mc); else if (d === 'outgoing') filteredOutgoing++; });
+                // Only process the last unreadCount incoming messages (the NEW ones).
+                // Older incoming messages are rejected as old_message.
+                var newMC = unreadCount > 0 ? inMC.slice(-unreadCount) : inMC;
+                var filteredOld = inMC.length - newMC.length;
+                var accSet = new Set(newMC);
                 const allImgs = main.querySelectorAll('img');
-                const imgs = Array.from(allImgs).filter(function(img) {
-                    if (!img.closest('[data-id]') && !img.closest('[data-testid="msg-bubble"]')) return false;
-                    return true;
-                });
+                const imgs = Array.from(allImgs).filter(function(img) { var mc = getMC(img); return mc && accSet.has(mc); });
                 const totalImgs = imgs.length;
-                // === DIAGNOSTICS: scan ALL media (img + video) for accept/reject logging ===
                 var diagnostics = [];
                 var totalVideos = main.querySelectorAll('video').length;
                 function diagEl(el, type) {
                     var s = el.getAttribute('src') || '';
                     var st = s.startsWith('blob:') ? 'BLOB' : s.startsWith('data:') ? 'DATA' : s.startsWith('http') ? 'HTTP' : 'OTHER';
-                    var c = el.closest('[data-id]') || el.closest('[data-testid="msg-bubble"]');
-                    var ih = !!(el.closest('header'));
-                    var w = type === 'video' ? (el.videoWidth || el.width || 0) : (el.naturalWidth || el.width || 0);
-                    var h = type === 'video' ? (el.videoHeight || el.height || 0) : (el.naturalHeight || el.height || 0);
-                    var inMsg = !!c;
-                    var acc = inMsg && st !== 'OTHER' && !s.startsWith('data:image/gif;base64,R0lGODlh') && !(w > 0 && h > 0 && w <= 80 && h <= 80);
-                    var rej = !inMsg ? (ih ? 'profile_image_or_header' : 'not_message_media') : (st === 'OTHER' ? 'invalid_src' : (s.startsWith('data:image/gif;base64,R0lGODlh') ? 'placeholder_gif' : ((w > 0 && h > 0 && w <= 80 && h <= 80) ? 'too_small' : '')));
-                    return { type: type, srcType: st, src: s.substring(0, 80), containerTestId: c ? (c.getAttribute('data-testid') || '') : '', containerDataId: c ? (c.getAttribute('data-id') || '') : '', inHeader: ih, inMessage: inMsg, width: w, height: h, accepted: acc, rejectReason: rej };
+                    var mc = getMC(el), dir = mc ? getDir(mc) : 'unknown', mid = mc ? (mc.getAttribute('data-id') || '') : '', mts = getTS(mc);
+                    var ih = !!(el.closest('header')), w = type === 'video' ? (el.videoWidth || el.width || 0) : (el.naturalWidth || el.width || 0), h = type === 'video' ? (el.videoHeight || el.height || 0) : (el.naturalHeight || el.height || 0);
+                    var inMsg = !!mc, inAcc = mc && accSet.has(mc);
+                    var acc = inAcc && dir === 'incoming' && st !== 'OTHER' && !s.startsWith('data:image/gif;base64,R0lGODlh') && !(w > 0 && h > 0 && w <= 80 && h <= 80);
+                    var rej = !inMsg ? (ih ? 'profile_image_or_header' : 'not_message_media') : (dir === 'outgoing' ? 'outgoing_message' : (!inAcc ? 'old_message' : (st === 'OTHER' ? 'invalid_src' : (s.startsWith('data:image/gif;base64,R0lGODlh') ? 'placeholder_gif' : ((w > 0 && h > 0 && w <= 80 && h <= 80) ? 'too_small' : '')))));
+                    return { type: type, srcType: st, src: s.substring(0, 80), direction: dir, messageId: mid, messageTimestamp: mts, inHeader: ih, width: w, height: h, accepted: acc, rejectReason: rej };
                 }
                 allImgs.forEach(function(im) { diagnostics.push(diagEl(im, 'image')); });
                 main.querySelectorAll('video').forEach(function(vi) { diagnostics.push(diagEl(vi, 'video')); });
-                const seen = new Set();
-                const allEntries = [];
-                const candidates = [];
-                const messageGroups = new Map();
-                var filteredSrc = 0;
-                var filteredSize = 0;
-                var filteredPlaceholder = 0;
-                var filteredDup = 0;
-
+                const seen = new Set(), allEntries = [], candidates = [], messageGroups = new Map();
+                var filteredSrc = 0, filteredSize = 0, filteredPlaceholder = 0, filteredDup = 0;
                 for (const img of imgs) {
                     const src = img.getAttribute('src') || '';
                     if (!src) { filteredSrc++; continue; }
                     if (!src.startsWith('blob:') && !src.startsWith('data:') && !src.startsWith('http')) { filteredSrc++; continue; }
-                    // Skip 1x1 transparent GIF placeholders
                     if (src.startsWith('data:image/gif;base64,R0lGODlh')) { filteredPlaceholder++; continue; }
-
-                    // Classify source type
-                    let sourceType = 'HTTP';
-                    if (src.startsWith('blob:')) sourceType = 'BLOB';
-                    else if (src.startsWith('data:')) sourceType = 'DATA';
-
-                    // Estimate bytes for DATA URLs (base64 payload)
+                    let sourceType = src.startsWith('blob:') ? 'BLOB' : src.startsWith('data:') ? 'DATA' : 'HTTP';
                     let estBytes = 0;
-                    if (sourceType === 'DATA') {
-                        const commaIdx = src.indexOf(',');
-                        if (commaIdx > 0) {
-                            const b64 = src.substring(commaIdx + 1);
-                            const padding = (b64.endsWith('==') ? 2 : (b64.endsWith('=') ? 1 : 0));
-                            estBytes = Math.floor((b64.length * 3) / 4) - padding;
-                        }
-                    }
-
-                    // Classify ORIGINAL / PREVIEW / UNKNOWN
-                    // DATA URLs < 30KB are thumbnails/avatars/previews (not customer originals).
-                    // BLOB/HTTP are full-resolution media responses captured by CDP.
-                    let classification = 'UNKNOWN';
-                    if (sourceType === 'DATA') {
-                        classification = (estBytes > 0 && estBytes < 30720) ? 'PREVIEW' : 'UNKNOWN';
-                    } else {
-                        classification = 'ORIGINAL';
-                    }
-
-                    const w = img.naturalWidth || img.width || 0;
-                    const h = img.naturalHeight || img.height || 0;
-                    // Filter small images (thumbnails/avatars/stickers) — ≤80x80 for ALL types.
-                    // Real customer photos are always > 80x80.
+                    if (sourceType === 'DATA') { const ci = src.indexOf(','); if (ci > 0) { const b64 = src.substring(ci + 1); estBytes = Math.floor((b64.length * 3) / 4) - (b64.endsWith('==') ? 2 : (b64.endsWith('=') ? 1 : 0)); } }
+                    let classification = sourceType === 'DATA' ? (estBytes > 0 && estBytes < 30720 ? 'PREVIEW' : 'UNKNOWN') : 'ORIGINAL';
+                    const w = img.naturalWidth || img.width || 0, h = img.naturalHeight || img.height || 0;
                     if (w > 0 && h > 0 && w <= 80 && h <= 80) { filteredSize++; continue; }
-
-                    // Deduplicate by src — same image appears multiple times in DOM
                     if (seen.has(src)) { filteredDup++; continue; }
                     seen.add(src);
-
-                    // Find message container for message-level correlation
-                    let msgEl = img.closest('[data-id]') || img.closest('[data-testid="msg-bubble"]') || null;
-                    let msgId = msgEl ? (msgEl.getAttribute('data-id') || msgEl.getAttribute('data-testid') || '') : '';
+                    let mc = getMC(img), msgId = mc ? (mc.getAttribute('data-id') || '') : '';
                     if (!msgId) msgId = 'nomsg_' + allEntries.length;
-
-                    const entry = { src: src, source: sourceType, bytes: estBytes, classification: classification, width: w, height: h, messageId: msgId };
+                    let dir = mc ? getDir(mc) : 'unknown', mts = getTS(mc);
+                    const entry = { src: src, source: sourceType, bytes: estBytes, classification: classification, width: w, height: h, messageId: msgId, direction: dir, messageTimestamp: mts };
                     allEntries.push(entry);
-                    candidates.push({ source: sourceType, classification: classification, bytes: estBytes, messageId: msgId });
+                    candidates.push({ source: sourceType, classification: classification, bytes: estBytes, messageId: msgId, direction: dir, messageTimestamp: mts });
                     if (!messageGroups.has(msgId)) messageGroups.set(msgId, []);
                     messageGroups.get(msgId).push(entry);
                 }
-
-                // Message-level correlation:
-                // - Drop PREVIEW (small DATA thumbnails) — never customer originals.
-                // - If an ORIGINAL (BLOB/HTTP) exists in the same message, also drop
-                //   UNKNOWN (large DATA) entries for that message — the blob is the real photo.
                 const images = [];
                 var filteredPreview = 0;
                 for (const [msgId, group] of messageGroups) {
@@ -2265,8 +2247,7 @@ public sealed class MediaCaptureService : IDisposable
                         images.push(e);
                     }
                 }
-
-                return JSON.stringify({ images: images, candidates: candidates, diagnostics: diagnostics, mainFound: true, totalImgs: totalImgs, totalVideos: totalVideos, filteredSrc: filteredSrc, filteredSize: filteredSize, filteredPlaceholder: filteredPlaceholder, filteredDup: filteredDup, filteredPreview: filteredPreview, filteredNotMessage: 0, messageGroups: messageGroups.size });
+                return JSON.stringify({ images: images, candidates: candidates, diagnostics: diagnostics, mainFound: true, totalImgs: totalImgs, totalVideos: totalVideos, filteredSrc: filteredSrc, filteredSize: filteredSize, filteredPlaceholder: filteredPlaceholder, filteredDup: filteredDup, filteredPreview: filteredPreview, filteredOutgoing: filteredOutgoing, filteredOld: filteredOld, messageGroups: messageGroups.size });
             })();
             """;
 
