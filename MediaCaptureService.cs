@@ -122,7 +122,29 @@ public sealed class MediaCaptureService : IDisposable
         // Now FindAndClickUnreadChat does detection + click + verify atomically
         // in a single script execution — the same DOM snapshot that finds the
         // unread badge also clicks its row.
-        var node = await ExecuteScriptJsonAsync(Scripts.FindAndClickUnreadChat);
+        // === Store-based unread detection (primary) ===
+        // Uses WhatsApp's internal JS store via window.require('WAWebCollections').Chat
+        // to get unreadCount directly — far more reliable than DOM badge scraping.
+        // Falls back to DOM-based FindAndClickUnreadChat if the store is unavailable.
+        var node = await ExecuteScriptJsonAsync(Scripts.FindAndClickUnreadViaStore);
+        var storeSource = node?["source"]?.GetValue<string>() ?? "";
+        var storeClicked = node?["clicked"]?.GetValue<bool>() ?? false;
+        var storeChatCount = node?["storeChatCount"]?.GetValue<int>() ?? 0;
+
+        _log.Write("UNREAD_DETECTION_SOURCE", storeSource);
+        _log.Write("UNREAD_DETECTION_CLICKED", storeClicked.ToString().ToLowerInvariant());
+        if (storeChatCount > 0)
+            _log.Write("STORE_CHAT_COUNT", storeChatCount.ToString());
+
+        if (!storeClicked)
+        {
+            _log.Write("UNREAD_DETECTION_FALLBACK", $"{storeSource} -> dom");
+            node = await ExecuteScriptJsonAsync(Scripts.FindAndClickUnreadChat);
+        }
+        else
+        {
+            _log.Write("UNREAD_DETECTION_SUCCESS", $"source=store name={node?["name"]?.GetValue<string>()} unread={node?["unreadCount"]?.GetValue<int>()}");
+        }
         var chatRowsFound = node?["chatRowsFound"]?.GetValue<int>() ?? 0;
         var unreadMarkersFound = node?["unreadMarkersFound"]?.GetValue<int>() ?? 0;
         var clicked = node?["clicked"]?.GetValue<bool>() ?? false;
@@ -2105,6 +2127,138 @@ public sealed class MediaCaptureService : IDisposable
                     });
                 } catch (e) {
                     return JSON.stringify({ error: e.message });
+                }
+            })();
+            """;
+
+        /// <summary>
+        /// Store-based unread detection — uses WhatsApp's internal JavaScript store
+        /// via window.require('WAWebCollections').Chat to get unreadCount directly.
+        /// This is far more reliable than DOM badge scraping because it doesn't
+        /// depend on DOM structure. After finding unread chats from the store,
+        /// it finds the matching DOM row and clicks it.
+        /// Returns the same fields as FindAndClickUnreadChat for seamless integration.
+        /// </summary>
+        public const string FindAndClickUnreadViaStore = """
+            (() => {
+                try {
+                    if (typeof window.require !== 'function') {
+                        return JSON.stringify({ clicked: false, reason: 'no_window_require', source: 'store', chatRowsFound: 0, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
+                    }
+
+                    var chatCollection = window.require('WAWebCollections');
+                    if (!chatCollection || !chatCollection.Chat) {
+                        return JSON.stringify({ clicked: false, reason: 'no_chat_collection', source: 'store', chatRowsFound: 0, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
+                    }
+
+                    var chats = chatCollection.Chat.getModelsArray();
+                    var unreadChats = [];
+                    for (var i = 0; i < chats.length; i++) {
+                        try {
+                            var chat = chats[i];
+                            if (chat.unreadCount > 0 && !chat.archive) {
+                                unreadChats.push({
+                                    id: (chat.id && chat.id._serialized) ? chat.id._serialized : '',
+                                    name: chat.formattedTitle || chat.name || '',
+                                    unreadCount: chat.unreadCount
+                                });
+                            }
+                        } catch (e) {}
+                    }
+
+                    var pane = document.querySelector('#pane-side');
+                    var domRows = pane ? pane.querySelectorAll('[data-testid="cell-frame-container"], [role="listitem"], div[data-id]') : [];
+                    var chatRowsFound = domRows.length;
+
+                    if (unreadChats.length === 0) {
+                        return JSON.stringify({ clicked: false, reason: 'no_unread_in_store', source: 'store', chatRowsFound: chatRowsFound, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false, storeChatCount: chats.length });
+                    }
+
+                    var targetName = unreadChats[0].name;
+                    var clickedRow = null;
+                    var clickedIndex = -1;
+
+                    for (var r = 0; r < domRows.length; r++) {
+                        var titleEl = domRows[r].querySelector('span[title]');
+                        var rowName = titleEl ? (titleEl.getAttribute('title') || '') : '';
+                        if (rowName && targetName &&
+                            (rowName === targetName ||
+                             (targetName.length > 2 && rowName.indexOf(targetName) >= 0) ||
+                             (rowName.length > 2 && targetName.indexOf(rowName) >= 0))) {
+                            clickedRow = domRows[r];
+                            clickedIndex = r;
+                            break;
+                        }
+                    }
+
+                    if (!clickedRow) {
+                        return JSON.stringify({ clicked: false, reason: 'row_not_found', source: 'store', chatRowsFound: chatRowsFound, unreadMarkersFound: unreadChats.length, name: targetName, clickTargetHtml: '', clickTargetIndex: -1, unreadCount: unreadChats[0].unreadCount, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: targetName, unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false, storeChatCount: chats.length, unreadChats: unreadChats });
+                    }
+
+                    function getActiveChatName() {
+                        var main = document.querySelector('#main');
+                        if (!main) return '';
+                        var header = main.querySelector('header');
+                        if (!header) return '';
+                        var titleEl = header.querySelector('span[title]');
+                        if (titleEl) { var t = (titleEl.getAttribute('title') || '').trim(); if (t) return t; }
+                        var spans = header.querySelectorAll('span[dir="auto"]');
+                        for (var i = 0; i < spans.length; i++) { var t = (spans[i].textContent || '').trim(); if (t && t.length > 0 && t.length < 100) return t; }
+                        return '';
+                    }
+
+                    var activeChatBefore = getActiveChatName();
+
+                    try { clickedRow.scrollIntoView({block: 'center'}); } catch(e) {}
+
+                    var interactive = clickedRow.querySelector('[role="button"], [tabindex], a, button');
+                    var clickTarget = interactive || clickedRow;
+                    var strategy = interactive ? 'interactive_descendant' : 'row_click';
+
+                    var clickElementTag = clickTarget.tagName;
+                    var clickElementRole = clickTarget.getAttribute('role') || '';
+                    var clickElementTabindex = clickTarget.getAttribute('tabindex') || '';
+
+                    var rect = clickTarget.getBoundingClientRect();
+                    var cx = rect.left + rect.width / 2;
+                    var cy = rect.top + rect.height / 2;
+
+                    function fire(type, ctor) {
+                        try {
+                            var ev = new (ctor || MouseEvent)(type, {
+                                bubbles: true, cancelable: true, view: window,
+                                clientX: cx, clientY: cy, button: 0, buttons: 1
+                            });
+                            clickTarget.dispatchEvent(ev);
+                        } catch(e) {}
+                    }
+
+                    if (window.PointerEvent) {
+                        fire('pointerover', PointerEvent);
+                        fire('pointerenter', PointerEvent);
+                        fire('pointerdown', PointerEvent);
+                    }
+                    fire('mouseover', MouseEvent);
+                    fire('mousedown', MouseEvent);
+                    if (window.PointerEvent) fire('pointerup', PointerEvent);
+                    fire('mouseup', MouseEvent);
+                    try { clickTarget.focus(); } catch(e) {}
+                    fire('click', MouseEvent);
+
+                    return JSON.stringify({
+                        clicked: true, source: 'store', name: targetName,
+                        chatRowsFound: chatRowsFound, unreadMarkersFound: unreadChats.length,
+                        clickTargetHtml: (clickedRow.outerHTML || '').substring(0, 300),
+                        clickTargetIndex: clickedIndex, unreadCount: unreadChats[0].unreadCount,
+                        atomicClickTargetName: targetName, atomicClickConnected: true, atomicClickUnreadPresent: true,
+                        activeChatBefore: activeChatBefore, activeChatAfter: activeChatBefore,
+                        navigationConfirmed: false, clickStrategy: strategy,
+                        clickElementTag: clickElementTag, clickElementRole: clickElementRole, clickElementTabindex: clickElementTabindex,
+                        unreadHandoffName: targetName, unreadHandoffRowConnected: true, unreadHandoffBadgeStillPresent: true,
+                        clickAttempted: true, storeChatCount: chats.length, unreadChats: unreadChats
+                    });
+                } catch (e) {
+                    return JSON.stringify({ clicked: false, reason: 'exception: ' + e.message, source: 'store', chatRowsFound: 0, unreadMarkersFound: 0, name: '', clickTargetHtml: '', clickTargetIndex: -1, unreadCount: 0, activeChatBefore: '', activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: '', unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
                 }
             })();
             """;
