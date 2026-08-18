@@ -187,22 +187,29 @@ public sealed class MediaCaptureService : IDisposable
         }
 
         // === lastMessageId change detection (top 50 chats) ===
-        // WhatsApp Web auto-marks messages as read when the window is focused,
-        // so unreadCount drops to 0 before the 15s polling timer fires.
-        // When lastMessageId changes between polls, treat it as a new event
-        // even if unreadCount=0 — open the chat and run the media scan chain.
         var storeAllChatLastMsgs = node?["storeAllChatLastMsgs"]?.AsArray();
         string? lastMsgChangedChatId = null;
         string? lastMsgChangedName = null;
         string? lastMsgChangedNewId = null;
-        if (storeAllChatLastMsgs != null)
+
+        // === FIRST SCAN CATCH-UP ===
+        // On the first scan, queue top 5 recent chats for processing.
+        // This handles messages that arrived before the app started
+        // (unreadCount=0, no baseline for lastMessageId change detection).
+        // MUST run BEFORE any early-return for no-unread.
+        // Uses storeAllChatLastMsgs (50 chats) or storeTopChats (20) as fallback.
+        _log.Write("FIRST_SCAN_ENTERED", _firstScanDone.ToString().ToLowerInvariant());
+        _log.Write("FIRST_SCAN_STORE_CHAT_COUNT", storeChatCount.ToString());
+        if (!_firstScanDone)
         {
-            // First scan catch-up: queue top 5 chats for processing
-            if (!_firstScanDone)
+            _firstScanDone = true;
+            var catchupSource = storeAllChatLastMsgs ?? storeTopChats;
+            var sourceName = storeAllChatLastMsgs != null ? "storeAllChatLastMsgs" : (storeTopChats != null ? "storeTopChats" : "null");
+            _log.Write("FIRST_SCAN_CATCHUP_SOURCE", sourceName);
+            if (catchupSource != null)
             {
-                _firstScanDone = true;
                 int catchupCount = 0;
-                foreach (var lc in storeAllChatLastMsgs)
+                foreach (var lc in catchupSource)
                 {
                     if (catchupCount >= 5) break;
                     var lcId = lc?["id"]?.GetValue<string>() ?? "";
@@ -214,8 +221,13 @@ public sealed class MediaCaptureService : IDisposable
                         catchupCount++;
                     }
                 }
-                _log.Write("FIRST_SCAN_CATCHUP_QUEUED", $"count={_catchupChats.Count}");
             }
+            _log.Write("FIRST_SCAN_CATCHUP_QUEUED", $"count={_catchupChats.Count}");
+        }
+        _log.Write("CATCHUP_QUEUE_COUNT", _catchupChats.Count.ToString());
+
+        if (storeAllChatLastMsgs != null)
+        {
             foreach (var lc in storeAllChatLastMsgs)
             {
                 var lcId = lc?["id"]?.GetValue<string>() ?? "";
@@ -365,6 +377,7 @@ public sealed class MediaCaptureService : IDisposable
                 lastMsgChangedNewId = catchup.lastMsg;
                 triggerSource = "catchup";
                 _log.Write("CATCHUP_PROCESSING", $"chatId={catchup.id} name={catchup.name} remaining={_catchupChats.Count}");
+                _log.Write("CATCHUP_TARGET_CHAT_ID", catchup.id);
             }
             else
             {
@@ -381,6 +394,8 @@ public sealed class MediaCaptureService : IDisposable
             var openStrategy = openNode?["clickStrategy"]?.GetValue<string>() ?? "";
             var openNavConfirmed = openNode?["navigationConfirmed"]?.GetValue<bool>() ?? false;
             var openActiveBefore = openNode?["activeChatBefore"]?.GetValue<string>() ?? "";
+
+            _log.Write("CATCHUP_CHAT_OPEN_RESULT", $"clicked={openClicked} name={openName} strategy={openStrategy} navConfirmed={openNavConfirmed}");
 
             if (openClicked && !string.IsNullOrWhiteSpace(openName))
             {
