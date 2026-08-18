@@ -178,14 +178,39 @@ public sealed class MediaCaptureService : IDisposable
                 var tcMuted = tc?["muted"]?.GetValue<bool>() ?? false;
                 var tcArchived = tc?["archived"]?.GetValue<bool>() ?? false;
                 _log.Write("STORE_TOP_CHAT", $"id={tcId} name={tcName} unread={tcUnread} lastMsg={tcLmid} t={tcT} muted={tcMuted} archived={tcArchived}");
+            }
+        }
 
-                if (!string.IsNullOrEmpty(tcId) && !string.IsNullOrEmpty(tcLmid))
+        // === lastMessageId change detection (top 50 chats) ===
+        // WhatsApp Web auto-marks messages as read when the window is focused,
+        // so unreadCount drops to 0 before the 15s polling timer fires.
+        // When lastMessageId changes between polls, treat it as a new event
+        // even if unreadCount=0 — open the chat and run the media scan chain.
+        var storeAllChatLastMsgs = node?["storeAllChatLastMsgs"]?.AsArray();
+        string? lastMsgChangedChatId = null;
+        string? lastMsgChangedName = null;
+        string? lastMsgChangedNewId = null;
+        if (storeAllChatLastMsgs != null)
+        {
+            foreach (var lc in storeAllChatLastMsgs)
+            {
+                var lcId = lc?["id"]?.GetValue<string>() ?? "";
+                var lcLmid = lc?["lastMessageId"]?.GetValue<string>() ?? "";
+                var lcName = lc?["name"]?.GetValue<string>() ?? "";
+                var lcUnread = lc?["unreadCount"]?.GetValue<int>() ?? 0;
+                if (!string.IsNullOrEmpty(lcId) && !string.IsNullOrEmpty(lcLmid))
                 {
-                    if (_lastMessageIds.TryGetValue(tcId, out var prevLmid) && prevLmid != tcLmid)
+                    if (_lastMessageIds.TryGetValue(lcId, out var prevLmid) && prevLmid != lcLmid)
                     {
-                        _log.Write("NEW_MESSAGE_BY_LASTMSG_CHANGE", $"chatId={tcId} name={tcName} old={prevLmid} new={tcLmid} unread={tcUnread}");
+                        _log.Write("NEW_MESSAGE_BY_LASTMSG_CHANGE", $"chatId={lcId} name={lcName} old={prevLmid} new={lcLmid} unread={lcUnread}");
+                        if (lastMsgChangedChatId == null)
+                        {
+                            lastMsgChangedChatId = lcId;
+                            lastMsgChangedName = lcName;
+                            lastMsgChangedNewId = lcLmid;
+                        }
                     }
-                    _lastMessageIds[tcId] = tcLmid;
+                    _lastMessageIds[lcId] = lcLmid;
                 }
             }
         }
@@ -301,9 +326,49 @@ public sealed class MediaCaptureService : IDisposable
 
         if (unreadMarkersFound == 0)
         {
-            ScannerStatusChanged?.Invoke($"Idle — {chatRowsFound} chats, 0 markers");
-            UpdateStatus("Idle — no unread chats");
-            return;
+            // === lastMessageId change trigger ===
+            // When unreadCount=0 (WhatsApp auto-read) but lastMessageId changed,
+            // open the chat by chatId and run the media scan chain.
+            if (lastMsgChangedChatId != null)
+            {
+                _log.Write("LASTMSG_CHANGE_DETECTED", $"chatId={lastMsgChangedChatId} name={lastMsgChangedName} newLastMsg={lastMsgChangedNewId}");
+                var openScript = MediaCaptureScripts.OpenChatByChatId.Replace("__CHAT_ID_JSON__", JsonSerializer.Serialize(lastMsgChangedChatId));
+                var openNode = await ExecuteScriptJsonAsync(openScript);
+                var openClicked = openNode?["clicked"]?.GetValue<bool>() ?? false;
+                var openName = openNode?["name"]?.GetValue<string>() ?? "";
+                var openStrategy = openNode?["clickStrategy"]?.GetValue<string>() ?? "";
+                var openNavConfirmed = openNode?["navigationConfirmed"]?.GetValue<bool>() ?? false;
+                var openActiveBefore = openNode?["activeChatBefore"]?.GetValue<string>() ?? "";
+
+                if (openClicked && !string.IsNullOrWhiteSpace(openName))
+                {
+                    _log.Write("CHAT_OPEN", $"source=lastmsg_change name={openName} chatId={lastMsgChangedChatId} strategy={openStrategy} navConfirmed={openNavConfirmed}");
+                    _log.Write("MEDIA_SCAN_STARTED", $"source=lastmsg_change name={openName} chatId={lastMsgChangedChatId}");
+                    // Override detection result — continue to media scan chain
+                    clicked = true;
+                    name = openName;
+                    chatId = lastMsgChangedChatId!;
+                    eventKey = $"{lastMsgChangedChatId}|{lastMsgChangedNewId}";
+                    chatUnreadCount = 0;
+                    navigationConfirmed = openNavConfirmed;
+                    activeChatBefore = openActiveBefore;
+                    clickStrategy = $"lastmsg_change:{openStrategy}";
+                    // Fall through to media scan chain (don't return)
+                }
+                else
+                {
+                    _log.Write("CHAT_OPEN_FAILED", $"source=lastmsg_change chatId={lastMsgChangedChatId} reason=row_not_found_or_no_name");
+                    ScannerStatusChanged?.Invoke("Idle — lastmsg change but open failed");
+                    UpdateStatus("Idle — lastmsg change open failed");
+                    return;
+                }
+            }
+            else
+            {
+                ScannerStatusChanged?.Invoke($"Idle — {chatRowsFound} chats, 0 markers");
+                UpdateStatus("Idle — no unread chats");
+                return;
+            }
         }
 
         _log.Write("SCAN_START", $"unread_chats={unreadMarkersFound}");
