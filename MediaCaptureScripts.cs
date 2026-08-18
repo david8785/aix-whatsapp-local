@@ -1087,9 +1087,25 @@ internal static class MediaCaptureScripts
                 }
                 return 'unknown';
             }
-            function getMC(el) { return el.closest('[data-testid="msg-container"]') || el.closest('[data-id]') || el.closest('[data-testid="msg-bubble"]'); }
+            function getMC(el) {
+                var mc = el.closest('[data-testid="msg-container"]') || el.closest('[data-id]') || el.closest('[data-testid="msg-bubble"]');
+                if (mc) return mc;
+                var n = el;
+                for (var i = 0; i < 15 && n; i++) {
+                    var c = (typeof n.className === 'string') ? n.className : '';
+                    if (/\bmessage-in\b/.test(c) || /\bmessage-out\b/.test(c)) return n;
+                    n = n.parentElement;
+                }
+                return null;
+            }
             function getTS(mc) { var t = mc ? mc.querySelector('time[datetime]') : null; return t ? (t.getAttribute('datetime') || '') : ''; }
-            var allMC = main.querySelectorAll('[data-testid="msg-container"], div[data-id]');
+            var allMCSet = new Set();
+            main.querySelectorAll('[data-testid="msg-container"], div[data-id]').forEach(function(el) { allMCSet.add(el); });
+            main.querySelectorAll('div[class*="message-in"], div[class*="message-out"]').forEach(function(el) {
+                var c = (typeof el.className === 'string') ? el.className : '';
+                if (/\bmessage-in\b/.test(c) || /\bmessage-out\b/.test(c)) allMCSet.add(el);
+            });
+            var allMC = Array.from(allMCSet);
             var inMC = [], filteredOutgoing = 0;
             allMC.forEach(function(mc) { var d = getDir(mc); if (d === 'incoming') inMC.push(mc); else if (d === 'outgoing') filteredOutgoing++; });
             var newMC = unreadCount > 0 ? inMC.slice(-unreadCount) : inMC.slice(-20);
