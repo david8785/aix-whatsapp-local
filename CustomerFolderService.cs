@@ -65,10 +65,39 @@ public static class CustomerFolderService
         var safePhone = SanitizePhone(phone);
         var folderName = $"{safeName}_{safePhone}_1";
         var folderPath = Path.Combine(ordersRoot, dateStr, hourStr, folderName);
-        Directory.CreateDirectory(folderPath);
+
+        // Create daily + hour + customer folder with verification + retry
+        EnsureDirectory(folderPath);
+        if (!Directory.Exists(folderPath))
+            throw new IOException($"Failed to create order folder: {folderPath}");
+
         var dailyRoot = Path.Combine(ordersRoot, dateStr);
         EnsureAllJunction(dailyRoot, folderPath);
         return folderPath;
+    }
+
+    /// <summary>
+    /// Create a directory and verify it exists. Retries up to 3 times on failure.
+    /// Creates all intermediate directories.
+    /// </summary>
+    private static void EnsureDirectory(string path)
+    {
+        if (Directory.Exists(path)) return;
+        for (int attempt = 0; attempt < 3; attempt++)
+        {
+            try
+            {
+                Directory.CreateDirectory(path);
+                if (Directory.Exists(path)) return;
+            }
+            catch (Exception) when (attempt < 2)
+            {
+                System.Threading.Thread.Sleep(100 * (attempt + 1));
+            }
+        }
+        // Final attempt — let it throw if it fails
+        if (!Directory.Exists(path))
+            Directory.CreateDirectory(path);
     }
 
     /// <summary>
@@ -121,6 +150,12 @@ public static class CustomerFolderService
     /// </summary>
     public static string SaveImage(string folderPath, byte[] bytes, int index)
     {
+        // Ensure the folder exists before writing (guards against race conditions
+        // where the folder was deleted between creation and save)
+        EnsureDirectory(folderPath);
+        if (!Directory.Exists(folderPath))
+            throw new IOException($"Cannot save image — folder does not exist: {folderPath}");
+
         var fileName = $"image_{index:D4}.jpg";
         var filePath = Path.Combine(folderPath, fileName);
         File.WriteAllBytes(filePath, bytes);
