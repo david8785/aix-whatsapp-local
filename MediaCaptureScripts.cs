@@ -1047,7 +1047,7 @@ internal static class MediaCaptureScripts
             var allMC = main.querySelectorAll('[data-testid="msg-container"], div[data-id]');
             var inMC = [], filteredOutgoing = 0;
             allMC.forEach(function(mc) { var d = getDir(mc); if (d === 'incoming') inMC.push(mc); else if (d === 'outgoing') filteredOutgoing++; });
-            var newMC = unreadCount > 0 ? inMC.slice(-unreadCount) : inMC;
+            var newMC = unreadCount > 0 ? inMC.slice(-unreadCount) : inMC.slice(-20);
             var filteredOld = inMC.length - newMC.length;
             var accSet = new Set(newMC);
             const allImgs = main.querySelectorAll('img');

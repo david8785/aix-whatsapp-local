@@ -35,6 +35,11 @@ public sealed class MediaCaptureService : IDisposable
     // even when unreadCount=0 (WhatsApp Web auto-marks messages as read when focused).
     private readonly Dictionary<string, string> _lastMessageIds = new(StringComparer.OrdinalIgnoreCase);
 
+    // First scan catch-up: process top 5 recent chats to handle messages that
+    // arrived before the app started (unreadCount=0, no baseline to compare).
+    private bool _firstScanDone = false;
+    private readonly List<(string id, string name, string lastMsg)> _catchupChats = new();
+
     // Tracks unread EVENT keys that have been successfully processed in this session.
     // Event key = chatId + "|" + lastMessageId — so the SAME customer sending NEW
     // messages later creates a NEW event key and gets processed again.
@@ -192,6 +197,25 @@ public sealed class MediaCaptureService : IDisposable
         string? lastMsgChangedNewId = null;
         if (storeAllChatLastMsgs != null)
         {
+            // First scan catch-up: queue top 5 chats for processing
+            if (!_firstScanDone)
+            {
+                _firstScanDone = true;
+                int catchupCount = 0;
+                foreach (var lc in storeAllChatLastMsgs)
+                {
+                    if (catchupCount >= 5) break;
+                    var lcId = lc?["id"]?.GetValue<string>() ?? "";
+                    var lcName = lc?["name"]?.GetValue<string>() ?? "";
+                    var lcLmid = lc?["lastMessageId"]?.GetValue<string>() ?? "";
+                    if (!string.IsNullOrEmpty(lcId))
+                    {
+                        _catchupChats.Add((lcId, lcName, lcLmid));
+                        catchupCount++;
+                    }
+                }
+                _log.Write("FIRST_SCAN_CATCHUP_QUEUED", $"count={_catchupChats.Count}");
+            }
             foreach (var lc in storeAllChatLastMsgs)
             {
                 var lcId = lc?["id"]?.GetValue<string>() ?? "";
@@ -326,47 +350,56 @@ public sealed class MediaCaptureService : IDisposable
 
         if (unreadMarkersFound == 0)
         {
-            // === lastMessageId change trigger ===
-            // When unreadCount=0 (WhatsApp auto-read) but lastMessageId changed,
-            // open the chat by chatId and run the media scan chain.
+            // === Decide which chat to process ===
+            string triggerSource = "lastmsg_change";
             if (lastMsgChangedChatId != null)
             {
                 _log.Write("LASTMSG_CHANGE_DETECTED", $"chatId={lastMsgChangedChatId} name={lastMsgChangedName} newLastMsg={lastMsgChangedNewId}");
-                var openScript = MediaCaptureScripts.OpenChatByChatId.Replace("__CHAT_ID_JSON__", JsonSerializer.Serialize(lastMsgChangedChatId));
-                var openNode = await ExecuteScriptJsonAsync(openScript);
-                var openClicked = openNode?["clicked"]?.GetValue<bool>() ?? false;
-                var openName = openNode?["name"]?.GetValue<string>() ?? "";
-                var openStrategy = openNode?["clickStrategy"]?.GetValue<string>() ?? "";
-                var openNavConfirmed = openNode?["navigationConfirmed"]?.GetValue<bool>() ?? false;
-                var openActiveBefore = openNode?["activeChatBefore"]?.GetValue<string>() ?? "";
-
-                if (openClicked && !string.IsNullOrWhiteSpace(openName))
-                {
-                    _log.Write("CHAT_OPEN", $"source=lastmsg_change name={openName} chatId={lastMsgChangedChatId} strategy={openStrategy} navConfirmed={openNavConfirmed}");
-                    _log.Write("MEDIA_SCAN_STARTED", $"source=lastmsg_change name={openName} chatId={lastMsgChangedChatId}");
-                    // Override detection result — continue to media scan chain
-                    clicked = true;
-                    name = openName;
-                    chatId = lastMsgChangedChatId!;
-                    eventKey = $"{lastMsgChangedChatId}|{lastMsgChangedNewId}";
-                    chatUnreadCount = 0;
-                    navigationConfirmed = openNavConfirmed;
-                    activeChatBefore = openActiveBefore;
-                    clickStrategy = $"lastmsg_change:{openStrategy}";
-                    // Fall through to media scan chain (don't return)
-                }
-                else
-                {
-                    _log.Write("CHAT_OPEN_FAILED", $"source=lastmsg_change chatId={lastMsgChangedChatId} reason=row_not_found_or_no_name");
-                    ScannerStatusChanged?.Invoke("Idle — lastmsg change but open failed");
-                    UpdateStatus("Idle — lastmsg change open failed");
-                    return;
-                }
+            }
+            else if (_catchupChats.Count > 0)
+            {
+                var catchup = _catchupChats[0];
+                _catchupChats.RemoveAt(0);
+                lastMsgChangedChatId = catchup.id;
+                lastMsgChangedName = catchup.name;
+                lastMsgChangedNewId = catchup.lastMsg;
+                triggerSource = "catchup";
+                _log.Write("CATCHUP_PROCESSING", $"chatId={catchup.id} name={catchup.name} remaining={_catchupChats.Count}");
             }
             else
             {
                 ScannerStatusChanged?.Invoke($"Idle — {chatRowsFound} chats, 0 markers");
                 UpdateStatus("Idle — no unread chats");
+                return;
+            }
+
+            // === Open the chat by chatId ===
+            var openScript = MediaCaptureScripts.OpenChatByChatId.Replace("__CHAT_ID_JSON__", JsonSerializer.Serialize(lastMsgChangedChatId));
+            var openNode = await ExecuteScriptJsonAsync(openScript);
+            var openClicked = openNode?["clicked"]?.GetValue<bool>() ?? false;
+            var openName = openNode?["name"]?.GetValue<string>() ?? "";
+            var openStrategy = openNode?["clickStrategy"]?.GetValue<string>() ?? "";
+            var openNavConfirmed = openNode?["navigationConfirmed"]?.GetValue<bool>() ?? false;
+            var openActiveBefore = openNode?["activeChatBefore"]?.GetValue<string>() ?? "";
+
+            if (openClicked && !string.IsNullOrWhiteSpace(openName))
+            {
+                _log.Write("CHAT_OPEN", $"source={triggerSource} name={openName} chatId={lastMsgChangedChatId} strategy={openStrategy} navConfirmed={openNavConfirmed}");
+                _log.Write("MEDIA_SCAN_STARTED", $"source={triggerSource} name={openName} chatId={lastMsgChangedChatId}");
+                clicked = true;
+                name = openName;
+                chatId = lastMsgChangedChatId!;
+                eventKey = $"{lastMsgChangedChatId}|{lastMsgChangedNewId}";
+                chatUnreadCount = 20;
+                navigationConfirmed = openNavConfirmed;
+                activeChatBefore = openActiveBefore;
+                clickStrategy = $"{triggerSource}:{openStrategy}";
+            }
+            else
+            {
+                _log.Write("CHAT_OPEN_FAILED", $"source={triggerSource} chatId={lastMsgChangedChatId} reason=row_not_found_or_no_name");
+                ScannerStatusChanged?.Invoke($"Idle — {triggerSource} open failed");
+                UpdateStatus($"Idle — {triggerSource} open failed");
                 return;
             }
         }
