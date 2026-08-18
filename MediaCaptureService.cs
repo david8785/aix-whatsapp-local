@@ -458,7 +458,7 @@ public sealed class MediaCaptureService : IDisposable
             _log.Write("NAV_TARGET_NAME", name ?? "");
             _log.Write("NAV_HEADER_NAME", headerName);
             _log.Write("NAV_HEADER_CHAT_ID", headerChatId);
-            _log.Write("NAV_PANEL_CHANGED", (!string.IsNullOrWhiteSpace(headerName) && headerName !== activeChatBefore).ToString().ToLowerInvariant());
+            _log.Write("NAV_PANEL_CHANGED", (!string.IsNullOrWhiteSpace(headerName) && headerName != activeChatBefore).ToString().ToLowerInvariant());
             _log.Write("NAV_VALIDATION_METHOD", validationMethod);
 
             navigationConfirmed = navConfirmedFromScript;
