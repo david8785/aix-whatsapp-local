@@ -551,6 +551,29 @@ internal static class MediaCaptureScripts
 
     public const string VerifyNavigation = """
         (() => {
+            var targetChatId = __CHAT_ID_JSON__;
+            var targetName = __TARGET_NAME_JSON__;
+            function getHeaderChatId() {
+                var main = document.querySelector('#main');
+                if (!main) return '';
+                var header = main.querySelector('header');
+                if (!header) return '';
+                var hid = header.getAttribute('data-id') || '';
+                if (hid) return hid;
+                var idEls = header.querySelectorAll('[data-id]');
+                for (var i = 0; i < idEls.length; i++) {
+                    var did = idEls[i].getAttribute('data-id') || '';
+                    if (did && did.indexOf('@') > 0) return did;
+                }
+                if (main) {
+                    var mainIdEls = main.querySelectorAll('[data-id]');
+                    for (var j = 0; j < mainIdEls.length && j < 30; j++) {
+                        var mdid = mainIdEls[j].getAttribute('data-id') || '';
+                        if (mdid && mdid.indexOf('@') > 0) return mdid;
+                    }
+                }
+                return '';
+            }
             function getActiveChatName() {
                 var main = document.querySelector('#main');
                 if (!main) return '';
@@ -568,7 +591,29 @@ internal static class MediaCaptureScripts
                 }
                 return '';
             }
-            return JSON.stringify({ activeChatName: getActiveChatName() });
+            var headerChatId = getHeaderChatId();
+            var headerName = getActiveChatName();
+            var chatIdMatch = false;
+            if (targetChatId && headerChatId) {
+                chatIdMatch = headerChatId === targetChatId;
+            }
+            var nameMatch = false;
+            if (!chatIdMatch && targetName && headerName) {
+                nameMatch = headerName === targetName ||
+                    (targetName.length > 3 && headerName.indexOf(targetName) >= 0) ||
+                    (headerName.length > 3 && targetName.indexOf(headerName) >= 0);
+            }
+            var validationMethod = chatIdMatch ? 'chat_id' : (nameMatch ? 'name' : 'failed');
+            var navigationConfirmed = chatIdMatch || nameMatch;
+            return JSON.stringify({
+                activeChatName: headerName,
+                headerChatId: headerChatId,
+                headerName: headerName,
+                validationMethod: validationMethod,
+                navigationConfirmed: navigationConfirmed,
+                chatIdMatch: chatIdMatch,
+                nameMatch: nameMatch
+            });
         })();
         """;
 
@@ -1235,6 +1280,7 @@ internal static class MediaCaptureScripts
                         clicked: true, source: 'store', name: targetName,
                         eventKey: unreadChats[0].eventKey, chatId: unreadChats[0].id,
                         storeUnreadTotal: unreadChats.length, storeUnreadChats: unreadChats, storeChatCount: chats.length,
+                        storeTopChats: storeTopChats, storeAllChatLastMsgs: storeAllChatLastMsgs,
                         chatRowsFound: chatRowsFound, unreadMarkersFound: unreadChats.length,
                         clickTargetHtml: '', clickTargetIndex: -1, unreadCount: unreadChats[0].unreadCount,
                         atomicClickTargetName: targetName, atomicClickConnected: true, atomicClickUnreadPresent: true,
@@ -1286,7 +1332,7 @@ internal static class MediaCaptureScripts
                 }
 
                 if (!clickedRow) {
-                    return JSON.stringify({ clicked: false, reason: 'row_not_found', source: 'store', storeUnreadTotal: unreadChats.length, storeUnreadChats: unreadChats, storeChatCount: chats.length, chatRowsFound: chatRowsFound, unreadMarkersFound: unreadChats.length, name: targetName, clickTargetHtml: '', clickTargetIndex: -1, unreadCount: unreadChats[0].unreadCount, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: targetName, unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
+                    return JSON.stringify({ clicked: false, reason: 'row_not_found', source: 'store', storeUnreadTotal: unreadChats.length, storeUnreadChats: unreadChats, storeChatCount: chats.length, storeTopChats: storeTopChats, storeAllChatLastMsgs: storeAllChatLastMsgs, chatRowsFound: chatRowsFound, unreadMarkersFound: unreadChats.length, name: targetName, clickTargetHtml: '', clickTargetIndex: -1, unreadCount: unreadChats[0].unreadCount, activeChatBefore: activeChatBefore, activeChatAfter: '', navigationConfirmed: false, clickStrategy: '', clickElementTag: '', clickElementRole: '', clickElementTabindex: '', unreadHandoffName: targetName, unreadHandoffRowConnected: false, unreadHandoffBadgeStillPresent: false, clickAttempted: false });
                 }
 
                 try { clickedRow.scrollIntoView({block: 'center'}); } catch(e) {}
@@ -1329,6 +1375,7 @@ internal static class MediaCaptureScripts
                     clicked: true, source: 'store', name: targetName,
                     eventKey: unreadChats[0].eventKey, chatId: unreadChats[0].id,
                     storeUnreadTotal: unreadChats.length, storeUnreadChats: unreadChats, storeChatCount: chats.length,
+                    storeTopChats: storeTopChats, storeAllChatLastMsgs: storeAllChatLastMsgs,
                     chatRowsFound: chatRowsFound, unreadMarkersFound: unreadChats.length,
                     clickTargetHtml: (clickedRow.outerHTML || '').substring(0, 300),
                     clickTargetIndex: clickedIndex, unreadCount: unreadChats[0].unreadCount,

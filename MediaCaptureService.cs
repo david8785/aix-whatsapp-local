@@ -444,12 +444,24 @@ public sealed class MediaCaptureService : IDisposable
         if (!navigationConfirmed)
         {
             await Task.Delay(2000);
-            var navNode = await ExecuteScriptJsonAsync(MediaCaptureScripts.VerifyNavigation);
+            var navScript = MediaCaptureScripts.VerifyNavigation
+                .Replace("__CHAT_ID_JSON__", JsonSerializer.Serialize(chatId ?? ""))
+                .Replace("__TARGET_NAME_JSON__", JsonSerializer.Serialize(name ?? ""));
+            var navNode = await ExecuteScriptJsonAsync(navScript);
             activeChatAfter = navNode?["activeChatName"]?.GetValue<string>() ?? "";
-            navigationConfirmed = !string.IsNullOrWhiteSpace(activeChatAfter) &&
-                (string.Equals(activeChatAfter, name, StringComparison.OrdinalIgnoreCase) ||
-                 (name.Length > 3 && activeChatAfter.Contains(name)) ||
-                 (activeChatAfter.Length > 3 && name.Contains(activeChatAfter)));
+            var headerChatId = navNode?["headerChatId"]?.GetValue<string>() ?? "";
+            var headerName = navNode?["headerName"]?.GetValue<string>() ?? "";
+            var validationMethod = navNode?["validationMethod"]?.GetValue<string>() ?? "";
+            var navConfirmedFromScript = navNode?["navigationConfirmed"]?.GetValue<bool>() ?? false;
+
+            _log.Write("NAV_TARGET_CHAT_ID", chatId ?? "");
+            _log.Write("NAV_TARGET_NAME", name ?? "");
+            _log.Write("NAV_HEADER_NAME", headerName);
+            _log.Write("NAV_HEADER_CHAT_ID", headerChatId);
+            _log.Write("NAV_PANEL_CHANGED", (!string.IsNullOrWhiteSpace(headerName) && headerName !== activeChatBefore).ToString().ToLowerInvariant());
+            _log.Write("NAV_VALIDATION_METHOD", validationMethod);
+
+            navigationConfirmed = navConfirmedFromScript;
         }
 
         _log.Write("TARGET_CHAT_ID", chatId);
