@@ -725,24 +725,43 @@ public sealed class MediaCaptureService : IDisposable
                 string folderPath;
                 try
                 {
-                    if (orderFolderBase != null)
+                    // === Ensure daily + hour directory structure exists before saving ===
+                    var hourPath = Path.GetDirectoryName(orderFolderBase);
+                    var dailyPath = hourPath != null ? Path.GetDirectoryName(hourPath) : null;
+                    if (dailyPath == null || hourPath == null)
                     {
-                        var existing = CustomerFolderService.FindExistingFolder(orderFolderBase);
-                        if (existing != null)
-                        {
-                            folderPath = existing;
-                        }
-                        else
-                        {
-                            folderPath = CustomerFolderService.CreateOrderFolder(_ordersRoot, customerName, phone);
-                            orderFolderBase = CustomerFolderService.GetBasePathFromFolder(folderPath);
-                        }
+                        failed++;
+                        _log.Write("MEDIA_FAILURE", $"stage=PATH_COMPUTE reason=null_daily_or_hour base={orderFolderBase}");
+                        continue;
+                    }
+                    Directory.CreateDirectory(dailyPath);
+                    Directory.CreateDirectory(hourPath);
+                    if (!Directory.Exists(dailyPath))
+                    {
+                        failed++;
+                        _log.Write("MEDIA_FAILURE", $"stage=DAILY_FOLDER reason=not_exists_after_create path={dailyPath}");
+                        continue;
+                    }
+                    if (!Directory.Exists(hourPath))
+                    {
+                        failed++;
+                        _log.Write("MEDIA_FAILURE", $"stage=HOUR_FOLDER reason=not_exists_after_create path={hourPath}");
+                        continue;
+                    }
+                    _log.Write("DAILY_FOLDER_VERIFIED", dailyPath);
+                    _log.Write("HOUR_FOLDER_VERIFIED", hourPath);
+
+                    var existing = CustomerFolderService.FindExistingFolder(orderFolderBase);
+                    if (existing != null)
+                    {
+                        folderPath = existing;
                     }
                     else
                     {
                         folderPath = CustomerFolderService.CreateOrderFolder(_ordersRoot, customerName, phone);
                         orderFolderBase = CustomerFolderService.GetBasePathFromFolder(folderPath);
                     }
+                    _log.Write("CUSTOMER_FOLDER_VERIFIED", folderPath);
                 }
                 catch (Exception ex)
                 {
